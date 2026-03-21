@@ -349,19 +349,33 @@ def compute_stats(images):
     counts = Counter(img["category"] for img in images)
     total = len(images)
 
+    # Compute target dataset size: for each category, determine the minimum
+    # total that would make the current count fit within its ideal ratio.
+    # The largest of these drives the target size.
+    # e.g., 17 face closeups at 10% ideal → need 170 total to be balanced.
+    target_total = total
+    for cat in CATEGORY_ORDER:
+        ratio = IDEAL_RATIO.get(cat, 0)
+        count = counts.get(cat, 0)
+        if ratio > 0 and count > 0:
+            implied_total = round(count / ratio)
+            target_total = max(target_total, implied_total)
+
     stats = {}
     for cat in CATEGORY_ORDER:
         count = counts.get(cat, 0)
         current_pct = (count / total * 100) if total > 0 else 0
         ideal_pct = IDEAL_RATIO.get(cat, 0) * 100
-        ideal_count = round(IDEAL_RATIO.get(cat, 0) * total)
+        ideal_count = round(IDEAL_RATIO.get(cat, 0) * target_total)
         deficit = max(0, ideal_count - count)
+        surplus = max(0, count - ideal_count) if ideal_count > 0 else 0
         stats[cat] = {
             "count": count,
             "current_pct": round(current_pct, 1),
             "ideal_pct": ideal_pct,
             "ideal_count": ideal_count,
             "deficit": deficit,
+            "surplus": surplus,
         }
 
     # Front-facing ratio for full_body
@@ -370,12 +384,13 @@ def compute_stats(images):
     fb_facing = sum(1 for img in fb_images if any(t in img["caption"].lower() for t in facing_tags))
     fb_total = len(fb_images)
 
-    # Suggested repeats
-    reps = 7 if total > 120 else 8 if total > 100 else 10 if total > 60 else 15
+    # Suggested repeats based on target size
+    reps = 7 if target_total > 120 else 8 if target_total > 100 else 10 if target_total > 60 else 15
 
     return {
         "categories": stats,
         "total": total,
+        "target_total": target_total,
         "full_body_facing": fb_facing,
         "full_body_total": fb_total,
         "suggested_repeats": reps,
@@ -1366,7 +1381,7 @@ function renderStats() {
   const view = document.getElementById('statsView');
 
   let html = '<h2>Dataset Balance</h2>';
-  html += '<table class="stats-table"><tr><th>Category</th><th>Count</th><th>Current</th><th>Ideal</th><th></th><th>Status</th></tr>';
+  html += '<table class="stats-table"><tr><th>Category</th><th>Count</th><th>Target</th><th>Current</th><th>Ideal</th><th></th><th>Status</th></tr>';
 
   const catLabels = {
     face_closeup: 'Face Closeup', head_shoulders: 'Head/Shoulders',
@@ -1380,18 +1395,20 @@ function renderStats() {
     const ideal = c.ideal_pct;
     let barClass = 'ok';
     if (cat === 'uncategorized' && c.count > 0) barClass = 'warn';
-    else if (pct < ideal - 5) barClass = 'low';
-    else if (pct > ideal + 10) barClass = 'over';
+    else if (c.surplus > 0) barClass = 'over';
+    else if (c.deficit > 0) barClass = 'low';
 
-    const barWidth = Math.min(100, Math.round((pct / Math.max(ideal, 1)) * 100));
+    const barWidth = Math.min(100, Math.round((c.count / Math.max(c.ideal_count, 1)) * 100));
     let status = '';
     if (cat === 'uncategorized' && c.count > 0) status = 'tag these';
-    else if (c.deficit > 0) status = 'need +' + c.deficit;
-    else status = 'ok';
+    else if (c.surplus > 0) status = '<span style="color:#3498db">over +' + c.surplus + '</span>';
+    else if (c.deficit > 0) status = '<span style="color:#f39c12">need +' + c.deficit + '</span>';
+    else status = '<span style="color:#2ecc71">ok</span>';
 
     html += `<tr>
       <td>${catLabels[cat] || cat}</td>
       <td>${c.count}</td>
+      <td>${c.ideal_count}</td>
       <td>${pct}%</td>
       <td>${ideal}%</td>
       <td><div class="stats-bar"><div class="stats-bar-fill ${barClass}" style="width:${barWidth}%"></div></div></td>
@@ -1400,9 +1417,11 @@ function renderStats() {
   }
   html += '</table>';
 
+  const toGenerate = Object.values(s.categories).reduce((sum, c) => sum + c.deficit, 0);
   html += '<div class="stats-summary">';
-  html += `<strong>Total images:</strong> ${s.total}<br>`;
-  html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.total * s.suggested_repeats} steps/epoch)<br>`;
+  html += `<strong>Current images:</strong> ${s.total}<br>`;
+  html += `<strong>Target dataset size:</strong> ${s.target_total}` + (toGenerate > 0 ? ` (need ~${toGenerate} more)` : '') + '<br>';
+  html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.target_total * s.suggested_repeats} steps/epoch)<br>`;
   if (s.full_body_total > 0) {
     const fbPct = Math.round(s.full_body_facing / s.full_body_total * 100);
     html += `<strong>Full body facing camera:</strong> ${s.full_body_facing}/${s.full_body_total} (${fbPct}%)`;
