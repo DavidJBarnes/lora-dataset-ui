@@ -33,7 +33,10 @@ import uuid
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote
 
-from project_config import conf
+import project_config
+from project_config import load_conf, CONF_FILE
+
+conf = project_config.conf
 
 # ---------------------------------------------------------------------------
 # Category detection (from analyze_dataset.py)
@@ -146,14 +149,28 @@ def strip_prefix(caption, model):
     return caption
 
 
+def dedupe_tags(tags):
+    """Remove duplicate tags (case-insensitive), preserving first occurrence and order."""
+    seen = set()
+    result = []
+    for tag in tags:
+        key = tag.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(tag)
+    return result
+
+
 def cleanup_caption(raw_caption, model):
-    """Clean a raw WD14 caption: remove character tags, add model prefix."""
+    """Clean a raw WD14 caption: remove character tags, dedupe, add model prefix."""
     # Strip any existing prefix
     text = strip_prefix(raw_caption.strip(), model)
     # Split into tags
     tags = [t.strip() for t in text.split(",")]
     # Remove character-specific tags
     tags = [t for t in tags if t and t.lower() not in REMOVE_TAGS_LOWER]
+    # Deduplicate
+    tags = dedupe_tags(tags)
     # Rebuild
     prefix = make_prefix(model)
     cleaned = ", ".join(tags)
@@ -410,13 +427,7 @@ def make_handler(base_dir, model):
                 images = get_images_with_categories(base_dir)
                 self._json_response(compute_stats(images))
             elif path == '/api/config':
-                self._json_response({
-                    "trigger": conf.get("TRIGGER", ""),
-                    "class": conf.get("CLASS", ""),
-                    "model": model,
-                    "dataset_path": os.path.abspath(base_dir),
-                    "subset_name": conf.get("SUBSET_NAME", ""),
-                })
+                self._get_config()
             elif path.startswith('/img/'):
                 self._serve_image(path[5:])
             elif path == '/favicon.ico':
@@ -435,6 +446,8 @@ def make_handler(base_dir, model):
                 self._handle_tag(self._read_body())
             elif path == '/api/set-category':
                 self._handle_set_category(self._read_body())
+            elif path == '/api/config':
+                self._save_config(self._read_body())
             else:
                 self.send_error(404)
 
@@ -488,6 +501,9 @@ def make_handler(base_dir, model):
                 return
             txt_path = os.path.splitext(img_path)[0] + '.txt'
             caption = data.get('caption', '')
+            # Deduplicate tags before saving
+            tags = dedupe_tags([t.strip() for t in caption.split(',')])
+            caption = ', '.join(t for t in tags if t)
             with open(txt_path, 'w') as f:
                 f.write(caption)
             category = categorize_caption(caption)
@@ -551,9 +567,10 @@ def make_handler(base_dir, model):
             prefix_tags = [t.strip() for t in prefix.split(',')]
             prefix_len = len(prefix_tags)
 
-            # Insert the new category tag after the prefix
+            # Insert the new category tag after the prefix, then dedupe
             new_tag = CATEGORY_PRIMARY_TAG[new_category]
             result_tags = cleaned_tags[:prefix_len] + [new_tag] + cleaned_tags[prefix_len:]
+            result_tags = dedupe_tags(result_tags)
             new_caption = ', '.join(t for t in result_tags if t)
 
             with open(txt_path, 'w') as f:
@@ -566,6 +583,34 @@ def make_handler(base_dir, model):
                 'category': new_category,
                 'caption': new_caption,
             })
+
+        def _get_config(self):
+            """Return project.conf raw content and parsed key-value pairs."""
+            raw = ''
+            if os.path.isfile(CONF_FILE):
+                with open(CONF_FILE, 'r') as f:
+                    raw = f.read()
+            self._json_response({
+                'raw': raw,
+                'path': CONF_FILE,
+                'model': model,
+            })
+
+        def _save_config(self, data):
+            """Save project.conf content and reload."""
+            global conf
+            raw = data.get('raw', '')
+            if not raw.strip():
+                self._json_response({'error': 'Empty config'}, 400)
+                return
+            with open(CONF_FILE, 'w') as f:
+                f.write(raw)
+            # Reload config globally
+            new_conf = load_conf()
+            conf = new_conf
+            project_config.conf = new_conf
+            print(f"  Saved project.conf ({len(raw)} bytes)")
+            self._json_response({'saved': True})
 
     return Handler
 
@@ -696,6 +741,19 @@ SPA_HTML = '''<!DOCTYPE html>
   .stats-summary { color: #aaa; font-size: 0.9em; line-height: 1.8; }
   .stats-summary strong { color: #eee; }
 
+  /* Config view */
+  .config-view { padding: 30px 40px; max-width: 900px; display: flex; flex-direction: column; height: calc(100vh - 120px); }
+  .config-view h2 { margin-bottom: 8px; font-size: 1.2em; color: #f39c12; }
+  .config-path { color: #666; font-size: 0.78em; margin-bottom: 12px; font-family: monospace; }
+  .config-view textarea { flex: 1; background: #0f3460; color: #eee; border: 1px solid #333; border-radius: 6px;
+                          padding: 15px; font-family: monospace; font-size: 0.85em; resize: none; line-height: 1.7;
+                          tab-size: 4; }
+  .config-view textarea:focus { outline: none; border-color: #3498db; }
+  .config-actions { display: flex; gap: 10px; padding-top: 12px; align-items: center; }
+  .config-actions button { padding: 8px 20px; }
+  .config-status { font-size: 0.82em; color: #888; margin-left: 10px; }
+  .config-actions .btn-save.dirty { background: #f39c12; }
+
   /* Task progress bar */
   .task-bar { position: fixed; bottom: 0; left: 0; right: 0; background: #16213e; border-top: 1px solid #333;
               padding: 10px 20px; display: none; z-index: 300; align-items: center; gap: 15px; }
@@ -733,6 +791,7 @@ SPA_HTML = '''<!DOCTYPE html>
   <div class="tab" data-tab="full_body" onclick="switchTab('full_body')">Full Body <span class="badge" id="badge-full_body">0</span></div>
   <div class="tab" data-tab="all" onclick="switchTab('all')">All <span class="badge" id="badge-all">0</span></div>
   <div class="tab" data-tab="stats" onclick="switchTab('stats')">Stats</div>
+  <div class="tab" data-tab="config" onclick="switchTab('config')">Config</div>
 </div>
 
 <div class="toolbar" id="toolbar">
@@ -750,6 +809,17 @@ SPA_HTML = '''<!DOCTYPE html>
 </div>
 
 <div class="stats-view" id="statsView" style="display:none;"></div>
+
+<div class="config-view" id="configView" style="display:none;">
+  <h2>project.conf</h2>
+  <div class="config-path" id="configPath"></div>
+  <textarea id="configText" spellcheck="false"></textarea>
+  <div class="config-actions">
+    <button class="btn-save" id="configSaveBtn" onclick="saveConfig()">Save (Ctrl+S)</button>
+    <button class="btn-refresh" onclick="loadConfig()">Reload</button>
+    <span class="config-status" id="configStatus"></span>
+  </div>
+</div>
 
 <div class="modal" id="modal">
   <div class="modal-layout">
@@ -831,13 +901,16 @@ function switchTab(tab) {
   activeTab = tab;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
 
-  const isStats = tab === 'stats';
-  document.getElementById('gallery').style.display = isStats ? 'none' : '';
-  document.getElementById('toolbar').style.display = isStats ? 'none' : '';
-  document.getElementById('statsView').style.display = isStats ? '' : 'none';
+  const isImageTab = !['stats', 'config'].includes(tab);
+  document.getElementById('gallery').style.display = isImageTab ? '' : 'none';
+  document.getElementById('toolbar').style.display = isImageTab ? '' : 'none';
+  document.getElementById('statsView').style.display = tab === 'stats' ? '' : 'none';
+  document.getElementById('configView').style.display = tab === 'config' ? '' : 'none';
 
-  if (isStats) {
+  if (tab === 'stats') {
     renderStats();
+  } else if (tab === 'config') {
+    loadConfig();
   } else {
     renderGrid();
   }
@@ -1314,15 +1387,80 @@ function renderStats() {
   view.innerHTML = html;
 }
 
+// --- Config tab ---
+let configOriginal = '';
+let configDirty = false;
+
+async function loadConfig() {
+  try {
+    const resp = await fetch('/api/config');
+    const data = await resp.json();
+    document.getElementById('configText').value = data.raw;
+    document.getElementById('configPath').textContent = data.path;
+    configOriginal = data.raw;
+    configDirty = false;
+    updateConfigUI();
+  } catch (e) { showToast('Failed to load config: ' + e.message, true); }
+}
+
+function onConfigInput() {
+  configDirty = document.getElementById('configText').value !== configOriginal;
+  updateConfigUI();
+}
+
+function updateConfigUI() {
+  const btn = document.getElementById('configSaveBtn');
+  btn.className = configDirty ? 'btn-save dirty' : 'btn-save';
+  btn.textContent = configDirty ? 'Save * (Ctrl+S)' : 'Save (Ctrl+S)';
+  document.getElementById('configStatus').textContent = configDirty ? 'Unsaved changes' : '';
+}
+
+async function saveConfig() {
+  const raw = document.getElementById('configText').value;
+  try {
+    const resp = await fetch('/api/config', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({raw})
+    });
+    const result = await resp.json();
+    if (result.saved) {
+      configOriginal = raw;
+      configDirty = false;
+      updateConfigUI();
+      document.getElementById('configStatus').textContent = 'Saved and reloaded';
+      showToast('Config saved');
+      // Refresh images since config may affect categories/prefix
+      loadImages();
+    } else {
+      showToast('Save failed: ' + (result.error || 'unknown'), true);
+    }
+  } catch (e) { showToast('Save failed: ' + e.message, true); }
+}
+
+// Attach input listener for config textarea
+document.getElementById('configText').addEventListener('input', onConfigInput);
+
 // --- Keyboard shortcuts ---
 document.addEventListener('keydown', (e) => {
+  // Ctrl+S: save in whatever context is active
+  if (e.ctrlKey && e.key === 's') {
+    e.preventDefault();
+    const modal = document.getElementById('modal');
+    if (modal.classList.contains('active')) {
+      saveCaption();
+    } else if (activeTab === 'config') {
+      saveConfig();
+    }
+    return;
+  }
+
+  // Modal-specific shortcuts
   const modal = document.getElementById('modal');
   if (!modal.classList.contains('active')) return;
 
   const inTextarea = document.activeElement === document.getElementById('captionText');
 
   if (e.key === 'Escape') { closeModal(); e.preventDefault(); }
-  if (e.ctrlKey && e.key === 's') { saveCaption(); e.preventDefault(); }
 
   if (!inTextarea) {
     if (e.key === 'ArrowLeft') navModal(-1);
