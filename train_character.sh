@@ -22,6 +22,9 @@ if [[ -z "$MODEL" ]]; then
   exit 1
 fi
 
+# Auto-detect PROJECT_DIR if not set
+PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}"
+
 # Computed paths
 SUBSET="${NUM_REPEATS}_${TRIGGER}_${CLASS}"
 DATASET_PATH_ABS="${PROJECT_DIR}/${DATASET_DIR}/${SUBSET}"

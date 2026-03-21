@@ -38,6 +38,10 @@ def load_conf(filepath=CONF_FILE):
             value = value.replace("$HOME", home)
             conf[key] = value
 
+    # Auto-detect PROJECT_DIR: directory containing project.conf
+    if "PROJECT_DIR" not in conf or not conf["PROJECT_DIR"]:
+        conf["PROJECT_DIR"] = os.path.dirname(os.path.abspath(filepath))
+
     # Computed paths
     trigger = conf.get("TRIGGER", "trigger")
     cls = conf.get("CLASS", "woman")
@@ -47,7 +51,7 @@ def load_conf(filepath=CONF_FILE):
     conf["SUBSET_NAME"] = f"{repeats}_{trigger}_{cls}"
     conf["DATASET_PATH"] = os.path.join(dataset_dir, conf["SUBSET_NAME"])
     conf["DATASET_PATH_ABS"] = os.path.join(
-        conf.get("PROJECT_DIR", "."), dataset_dir, conf["SUBSET_NAME"]
+        conf["PROJECT_DIR"], dataset_dir, conf["SUBSET_NAME"]
     )
 
     return conf
