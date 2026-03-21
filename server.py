@@ -260,7 +260,7 @@ def run_tagger_task(task_id, dataset_dir, model):
             update_task(task_id, status="failed", error=f"Tagger script not found: {tagger_script}")
             return
 
-        # Step 1: Record ALL existing captions (to merge with later)
+        # Step 1: Back up and remove existing captions so tagger processes all images
         existing_captions = {}
         image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
         image_files = [f for f in os.listdir(dataset_dir)
@@ -272,8 +272,9 @@ def run_tagger_task(task_id, dataset_dir, model):
             if os.path.isfile(txt_path):
                 with open(txt_path, 'r') as f:
                     existing_captions[txt_file] = f.read().strip()
+                os.remove(txt_path)
 
-        # Step 2: Run WD14 tagger on ALL images
+        # Step 2: Run WD14 tagger on ALL images (no .txt files exist, so it tags everything)
         gpu = conf.get("TAGGER_GPU", "false").lower() == "true"
         batch_size = "8" if gpu else "1"
         update_task(task_id, progress=f"0/{len(image_files)}",
@@ -292,6 +293,10 @@ def run_tagger_task(task_id, dataset_dir, model):
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if result.returncode != 0:
+            # Restore backups on failure
+            for txt_file, content in existing_captions.items():
+                with open(os.path.join(dataset_dir, txt_file), 'w') as f:
+                    f.write(content)
             update_task(task_id, status="failed",
                         error=f"Auto-caption failed: {result.stderr[:500]}")
             return
@@ -322,9 +327,11 @@ def run_tagger_task(task_id, dataset_dir, model):
         update_task(task_id, status="complete",
                     message=f"Auto-captioned {processed} images")
 
-    except subprocess.TimeoutExpired:
-        update_task(task_id, status="failed", error="Tagger timed out (10 min limit)")
-    except Exception as e:
+    except (subprocess.TimeoutExpired, Exception) as e:
+        # Restore backups on any failure
+        for txt_file, content in existing_captions.items():
+            with open(os.path.join(dataset_dir, txt_file), 'w') as f:
+                f.write(content)
         update_task(task_id, status="failed", error=str(e))
 
 
