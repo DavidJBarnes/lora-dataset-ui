@@ -448,6 +448,8 @@ def make_handler(base_dir, model):
                 self._handle_set_category(self._read_body())
             elif path == '/api/config':
                 self._save_config(self._read_body())
+            elif path == '/api/setup':
+                self._handle_setup()
             else:
                 self.send_error(404)
 
@@ -611,6 +613,28 @@ def make_handler(base_dir, model):
             project_config.conf = new_conf
             print(f"  Saved project.conf ({len(raw)} bytes)")
             self._json_response({'saved': True})
+
+        def _handle_setup(self):
+            """Create project directory structure from current config."""
+            project_dir = conf.get("PROJECT_DIR", ".")
+            dataset_path = conf.get("DATASET_PATH", "dataset/img")
+            dirs = [
+                os.path.join(project_dir, dataset_path),
+                os.path.join(project_dir, "outputs"),
+                os.path.join(project_dir, "logs"),
+                os.path.join(project_dir, "samples"),
+            ]
+            created = []
+            for d in dirs:
+                if not os.path.isdir(d):
+                    os.makedirs(d, exist_ok=True)
+                    created.append(os.path.relpath(d, project_dir))
+            if created:
+                print(f"  Setup created: {', '.join(created)}")
+            self._json_response({
+                'created': created,
+                'message': f"Created {len(created)} directories" if created else "All directories already exist",
+            })
 
     return Handler
 
@@ -817,6 +841,7 @@ SPA_HTML = '''<!DOCTYPE html>
   <div class="config-actions">
     <button class="btn-save" id="configSaveBtn" onclick="saveConfig()">Save (Ctrl+S)</button>
     <button class="btn-refresh" onclick="loadConfig()">Reload</button>
+    <button class="btn-tag" onclick="runSetup()">Run Setup</button>
     <span class="config-status" id="configStatus"></span>
   </div>
 </div>
@@ -1437,6 +1462,22 @@ async function saveConfig() {
   } catch (e) { showToast('Save failed: ' + e.message, true); }
 }
 
+async function runSetup() {
+  try {
+    const resp = await fetch('/api/setup', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const result = await resp.json();
+    if (result.created && result.created.length > 0) {
+      showToast('Created: ' + result.created.join(', '));
+    } else {
+      showToast(result.message);
+    }
+    loadImages();
+  } catch (e) { showToast('Setup failed: ' + e.message, true); }
+}
+
 // Attach input listener for config textarea
 document.getElementById('configText').addEventListener('input', onConfigInput);
 
@@ -1499,8 +1540,8 @@ def main():
 
     dataset_dir = args.dir or conf.get("DATASET_PATH", "dataset/img")
     if not os.path.isdir(dataset_dir):
-        print(f"Error: '{dataset_dir}' not found. Run setup.sh first.")
-        sys.exit(1)
+        os.makedirs(dataset_dir, exist_ok=True)
+        print(f"  Created: {dataset_dir}")
 
     handler = make_handler(dataset_dir, args.model)
     server = HTTPServer(('0.0.0.0', args.port), handler)
