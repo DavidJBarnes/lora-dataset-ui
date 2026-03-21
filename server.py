@@ -252,15 +252,17 @@ def run_tagger_task(task_id, dataset_dir, model):
             update_task(task_id, status="complete", message="All images already have captions")
             return
 
-        update_task(task_id, progress=f"0/{uncaptioned_count}",
-                    message=f"Running WD14 tagger on {uncaptioned_count} uncaptioned images...")
-
         # Step 2: Run WD14 tagger on the directory
+        gpu = conf.get("TAGGER_GPU", "false").lower() == "true"
+        batch_size = "8" if gpu else "1"
+        update_task(task_id, progress=f"0/{uncaptioned_count}",
+                    message=f"Running WD14 tagger ({'GPU' if gpu else 'CPU'}, batch={batch_size}) on {uncaptioned_count} images...")
+
         model_dir = os.path.join(sd_scripts, "wd14_models")
         cmd = [
             venv_python, tagger_script,
             "--onnx",
-            "--batch_size", "4",
+            "--batch_size", batch_size,
             "--thresh", "0.35",
             "--caption_extension", ".txt",
             "--model_dir", model_dir,
