@@ -216,8 +216,34 @@ def get_task(task_id):
 # WD14 Tagger integration
 # ---------------------------------------------------------------------------
 
+def merge_captions(existing_caption, wd14_raw, model):
+    """Merge WD14 tags into an existing caption, preserving user tags. Dedupes."""
+    # Parse existing caption: strip prefix, split into tags
+    existing_stripped = strip_prefix(existing_caption.strip(), model)
+    existing_tags = [t.strip() for t in existing_stripped.split(",") if t.strip()]
+    existing_lower = {t.lower() for t in existing_tags}
+
+    # Parse WD14 output into tags, apply cleanup (remove character tags)
+    wd14_tags = [t.strip() for t in wd14_raw.split(",") if t.strip()]
+    wd14_tags = [t for t in wd14_tags if t and t.lower() not in REMOVE_TAGS_LOWER]
+
+    # Add WD14 tags that aren't already present
+    for tag in wd14_tags:
+        if tag.lower() not in existing_lower:
+            existing_tags.append(tag)
+            existing_lower.add(tag.lower())
+
+    # Dedupe and rebuild with prefix
+    tags = dedupe_tags(existing_tags)
+    prefix = make_prefix(model)
+    cleaned = ", ".join(t for t in tags if t)
+    if cleaned:
+        return f"{prefix}, {cleaned}"
+    return prefix
+
+
 def run_tagger_task(task_id, dataset_dir, model):
-    """Background task: run WD14 tagger on uncaptioned images, then cleanup."""
+    """Background task: run WD14 tagger on all images, merge with existing captions."""
     try:
         sd_scripts = conf.get("SD_SCRIPTS", "")
         if not sd_scripts or not os.path.isdir(sd_scripts):
@@ -234,7 +260,7 @@ def run_tagger_task(task_id, dataset_dir, model):
             update_task(task_id, status="failed", error=f"Tagger script not found: {tagger_script}")
             return
 
-        # Step 1: Record existing captions (to preserve user edits)
+        # Step 1: Record ALL existing captions (to merge with later)
         existing_captions = {}
         image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
         image_files = [f for f in os.listdir(dataset_dir)
@@ -245,18 +271,13 @@ def run_tagger_task(task_id, dataset_dir, model):
             txt_path = os.path.join(dataset_dir, txt_file)
             if os.path.isfile(txt_path):
                 with open(txt_path, 'r') as f:
-                    existing_captions[txt_file] = f.read()
+                    existing_captions[txt_file] = f.read().strip()
 
-        uncaptioned_count = len(image_files) - len(existing_captions)
-        if uncaptioned_count == 0:
-            update_task(task_id, status="complete", message="All images already have captions")
-            return
-
-        # Step 2: Run WD14 tagger on the directory
+        # Step 2: Run WD14 tagger on ALL images
         gpu = conf.get("TAGGER_GPU", "false").lower() == "true"
         batch_size = "8" if gpu else "1"
-        update_task(task_id, progress=f"0/{uncaptioned_count}",
-                    message=f"Running WD14 tagger ({'GPU' if gpu else 'CPU'}, batch={batch_size}) on {uncaptioned_count} images...")
+        update_task(task_id, progress=f"0/{len(image_files)}",
+                    message=f"Running WD14 tagger ({'GPU' if gpu else 'CPU'}, batch={batch_size}) on {len(image_files)} images...")
 
         model_dir = os.path.join(sd_scripts, "wd14_models")
         cmd = [
@@ -272,32 +293,34 @@ def run_tagger_task(task_id, dataset_dir, model):
 
         if result.returncode != 0:
             update_task(task_id, status="failed",
-                        error=f"Tagger failed: {result.stderr[:500]}")
+                        error=f"Auto-caption failed: {result.stderr[:500]}")
             return
 
-        # Step 3: Restore pre-existing captions
-        for txt_file, content in existing_captions.items():
-            txt_path = os.path.join(dataset_dir, txt_file)
-            with open(txt_path, 'w') as f:
-                f.write(content)
-
-        # Step 4: Cleanup newly-generated captions only
-        new_captions = 0
+        # Step 3: For each image, merge WD14 output with existing user tags
+        processed = 0
         for img_file in image_files:
             txt_file = os.path.splitext(img_file)[0] + '.txt'
-            if txt_file not in existing_captions:
-                txt_path = os.path.join(dataset_dir, txt_file)
-                if os.path.isfile(txt_path):
-                    with open(txt_path, 'r') as f:
-                        raw = f.read().strip()
-                    cleaned = cleanup_caption(raw, model)
-                    with open(txt_path, 'w') as f:
-                        f.write(cleaned)
-                    new_captions += 1
-                    update_task(task_id, progress=f"{new_captions}/{uncaptioned_count}")
+            txt_path = os.path.join(dataset_dir, txt_file)
+            if not os.path.isfile(txt_path):
+                continue
+
+            with open(txt_path, 'r') as f:
+                wd14_raw = f.read().strip()
+
+            if txt_file in existing_captions:
+                # Merge: keep user tags, add new WD14 tags
+                merged = merge_captions(existing_captions[txt_file], wd14_raw, model)
+            else:
+                # New caption: just clean up
+                merged = cleanup_caption(wd14_raw, model)
+
+            with open(txt_path, 'w') as f:
+                f.write(merged)
+            processed += 1
+            update_task(task_id, progress=f"{processed}/{len(image_files)}")
 
         update_task(task_id, status="complete",
-                    message=f"Tagged and cleaned {new_captions} new captions")
+                    message=f"Auto-captioned {processed} images")
 
     except subprocess.TimeoutExpired:
         update_task(task_id, status="failed", error="Tagger timed out (10 min limit)")
@@ -839,7 +862,7 @@ SPA_HTML = '''<!DOCTYPE html>
 </div>
 
 <div class="toolbar" id="toolbar">
-  <button class="btn-tag" id="tagBtn" onclick="runTagger()">Tag Uncaptioned</button>
+  <button class="btn-tag" id="tagBtn" onclick="runTagger()">Auto Caption</button>
   <button class="btn-delete" id="deleteBtn" disabled onclick="deleteSelected()">Delete (0)</button>
   <button class="btn-select" onclick="selectAllVisible()">Select All</button>
   <button class="btn-select" onclick="selectNone()">Select None</button>
@@ -900,7 +923,7 @@ SPA_HTML = '''<!DOCTYPE html>
 </div>
 
 <div class="task-bar" id="taskBar">
-  <span class="task-label" id="taskLabel">Tagging...</span>
+  <span class="task-label" id="taskLabel">Captioning...</span>
   <div class="task-progress"><div class="task-fill" id="taskFill" style="width:0%"></div></div>
   <span class="task-status" id="taskStatus"></span>
 </div>
@@ -1298,13 +1321,12 @@ async function deleteCurrentInModal() {
 // --- WD14 Tagger ---
 async function runTagger() {
   if (activeTaskId) { showToast('A task is already running', true); return; }
-  const uncaptioned = allImages.filter(img => !img.has_caption).length;
-  if (uncaptioned === 0) { showToast('All images already have captions'); return; }
-  if (!confirm(`Run WD14 tagger on ${uncaptioned} uncaptioned image(s)?`)) return;
+  if (allImages.length === 0) { showToast('No images to caption'); return; }
+  if (!confirm(`Run auto-caption on ${allImages.length} image(s)? Existing tags will be preserved.`)) return;
 
   const btn = document.getElementById('tagBtn');
   btn.disabled = true;
-  btn.textContent = 'Tagging...';
+  btn.textContent = 'Captioning...';
 
   try {
     const resp = await fetch('/api/tag', {
@@ -1317,7 +1339,7 @@ async function runTagger() {
   } catch (e) {
     showToast('Failed to start tagger: ' + e.message, true);
     btn.disabled = false;
-    btn.textContent = 'Tag Uncaptioned';
+    btn.textContent = 'Auto Caption';
   }
 }
 
@@ -1349,14 +1371,14 @@ function pollTask(taskId) {
 
         if (task.error) {
           document.getElementById('taskStatus').textContent = 'Error: ' + task.error;
-          showToast('Tagger failed: ' + task.error, true);
+          showToast('Auto-caption failed: ' + task.error, true);
         } else {
           showToast(task.message || 'Done');
         }
 
         activeTaskId = null;
         document.getElementById('tagBtn').disabled = false;
-        document.getElementById('tagBtn').textContent = 'Tag Uncaptioned';
+        document.getElementById('tagBtn').textContent = 'Auto Caption';
 
         // Refresh images
         loadImages();
@@ -1368,7 +1390,7 @@ function pollTask(taskId) {
       activeTaskId = null;
       bar.className = 'task-bar';
       document.getElementById('tagBtn').disabled = false;
-      document.getElementById('tagBtn').textContent = 'Tag Uncaptioned';
+      document.getElementById('tagBtn').textContent = 'Auto Caption';
     }
   };
   poll();
