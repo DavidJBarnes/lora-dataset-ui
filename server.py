@@ -1,0 +1,1389 @@
+#!/usr/bin/env python3
+"""
+server.py — Dataset preparation SPA for LoRA training.
+
+Category-based image browser with integrated WD14 tagging, caption editing,
+and dataset balance analysis. Single-page app served from one file.
+
+Usage:
+    python server.py --model lustify
+    python server.py --model pony --port 9000
+    python server.py --model lustify --dir dataset/img/10_k3lly-young_woman
+
+Controls:
+    Click          = select/deselect for deletion
+    Shift+Click    = full-size preview + caption editor
+    Double-click   = full-size preview + caption editor
+    Arrow keys     = navigate in preview
+    D key          = mark for delete + next (in preview)
+    Ctrl+S         = save caption (in preview)
+    Escape         = close preview
+"""
+
+import argparse
+import json
+import mimetypes
+import os
+import re
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import unquote
+
+from project_config import conf
+
+# ---------------------------------------------------------------------------
+# Category detection (from analyze_dataset.py)
+# ---------------------------------------------------------------------------
+
+CATEGORY_TAGS = {
+    "face_closeup": [
+        "close-up", "close_up", "closeup", "face_focus", "face focus",
+        "extreme_close-up", "extreme_closeup", "head_focus",
+    ],
+    "head_shoulders": [
+        "portrait", "head_and_shoulders", "head and shoulders",
+        "bust", "headshot",
+    ],
+    "upper_body": [
+        "upper_body", "upper body", "cowboy_shot", "cowboy shot",
+        "waist_up", "waist up", "from_chest", "from chest",
+    ],
+    "full_body": [
+        "full_body", "full body", "feet", "standing", "walking",
+        "full_shot", "full shot", "wide_shot", "wide shot",
+        "legs", "shoes", "sneakers", "boots", "sandals", "heels",
+        "feet_visible",
+    ],
+}
+
+# The representative tag to INSERT when setting a category via the UI
+CATEGORY_PRIMARY_TAG = {
+    "face_closeup": "close-up",
+    "head_shoulders": "portrait",
+    "upper_body": "upper_body",
+    "full_body": "full_body",
+}
+
+IDEAL_RATIO = {
+    "face_closeup": 0.10,
+    "head_shoulders": 0.10,
+    "upper_body": 0.15,
+    "full_body": 0.65,
+    "uncategorized": 0.00,
+}
+
+CATEGORY_ORDER = ["face_closeup", "head_shoulders", "upper_body", "full_body", "uncategorized"]
+
+
+def categorize_caption(caption_text):
+    """Return category string based on tags found in caption."""
+    text_lower = caption_text.lower()
+    # Check order: face_closeup → upper_body → full_body → head_shoulders
+    for tag in CATEGORY_TAGS["face_closeup"]:
+        if tag in text_lower:
+            return "face_closeup"
+    for tag in CATEGORY_TAGS["upper_body"]:
+        if tag in text_lower:
+            return "upper_body"
+    for tag in CATEGORY_TAGS["full_body"]:
+        if tag in text_lower:
+            return "full_body"
+    for tag in CATEGORY_TAGS["head_shoulders"]:
+        if tag in text_lower:
+            return "head_shoulders"
+    return "uncategorized"
+
+
+# ---------------------------------------------------------------------------
+# Caption cleanup (ported from tagger_cleanup.sh)
+# ---------------------------------------------------------------------------
+
+REMOVE_TAGS = {
+    "blonde_hair", "blonde hair",
+    "dirty_blonde", "dirty blonde",
+    "light_brown_hair", "light brown hair",
+    "brown_hair",
+    "blue_eyes", "blue eyes",
+    "grey_eyes", "grey eyes",
+    "green_eyes", "green eyes",
+    "freckles",
+    "oval_face", "oval face",
+    "slim", "thin",
+    "pale_skin", "pale skin",
+    "light_skin", "light skin",
+    "1girl", "solo",
+    "breasts", "small_breasts", "medium_breasts", "large_breasts",
+}
+
+REMOVE_TAGS_LOWER = {t.lower() for t in REMOVE_TAGS}
+
+
+def make_prefix(model):
+    """Build the caption prefix for a given model."""
+    trigger = conf.get("TRIGGER", "trigger")
+    cls = conf.get("CLASS", "woman")
+    if model == "pony":
+        return f"score_9, score_8_up, score_7_up, source_realistic, {trigger} {cls}"
+    return f"{trigger} {cls}"
+
+
+def strip_prefix(caption, model):
+    """Remove any existing model prefix from the start of a caption."""
+    trigger = conf.get("TRIGGER", "trigger")
+    cls = conf.get("CLASS", "woman")
+    pony_prefix = f"score_9, score_8_up, score_7_up, source_realistic, {trigger} {cls}"
+    lustify_prefix = f"{trigger} {cls}"
+    # Strip pony first (longer), then lustify
+    for pfx in [pony_prefix, lustify_prefix]:
+        if caption.startswith(pfx):
+            caption = caption[len(pfx):]
+            caption = caption.lstrip(", ")
+            break
+    return caption
+
+
+def cleanup_caption(raw_caption, model):
+    """Clean a raw WD14 caption: remove character tags, add model prefix."""
+    # Strip any existing prefix
+    text = strip_prefix(raw_caption.strip(), model)
+    # Split into tags
+    tags = [t.strip() for t in text.split(",")]
+    # Remove character-specific tags
+    tags = [t for t in tags if t and t.lower() not in REMOVE_TAGS_LOWER]
+    # Rebuild
+    prefix = make_prefix(model)
+    cleaned = ", ".join(tags)
+    if cleaned:
+        return f"{prefix}, {cleaned}"
+    return prefix
+
+
+# ---------------------------------------------------------------------------
+# Background task system
+# ---------------------------------------------------------------------------
+
+_tasks = {}
+_tasks_lock = threading.Lock()
+
+
+def create_task(name):
+    """Create a background task entry, return task_id."""
+    task_id = str(uuid.uuid4())[:8]
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "name": name,
+            "status": "running",
+            "progress": "",
+            "message": "Starting...",
+            "error": None,
+        }
+    return task_id
+
+
+def update_task(task_id, **kwargs):
+    with _tasks_lock:
+        if task_id in _tasks:
+            _tasks[task_id].update(kwargs)
+
+
+def get_task(task_id):
+    with _tasks_lock:
+        return dict(_tasks.get(task_id, {}))
+
+
+# ---------------------------------------------------------------------------
+# WD14 Tagger integration
+# ---------------------------------------------------------------------------
+
+def run_tagger_task(task_id, dataset_dir, model):
+    """Background task: run WD14 tagger on uncaptioned images, then cleanup."""
+    try:
+        sd_scripts = conf.get("SD_SCRIPTS", "")
+        if not sd_scripts or not os.path.isdir(sd_scripts):
+            update_task(task_id, status="failed", error="SD_SCRIPTS path not found")
+            return
+
+        venv_python = os.path.join(sd_scripts, "venv", "bin", "python")
+        tagger_script = os.path.join(sd_scripts, "finetune", "tag_images_by_wd14_tagger.py")
+
+        if not os.path.isfile(venv_python):
+            update_task(task_id, status="failed", error=f"venv python not found: {venv_python}")
+            return
+        if not os.path.isfile(tagger_script):
+            update_task(task_id, status="failed", error=f"Tagger script not found: {tagger_script}")
+            return
+
+        # Step 1: Record existing captions (to preserve user edits)
+        existing_captions = {}
+        image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+        image_files = [f for f in os.listdir(dataset_dir)
+                       if os.path.splitext(f)[1].lower() in image_exts]
+
+        for img_file in image_files:
+            txt_file = os.path.splitext(img_file)[0] + '.txt'
+            txt_path = os.path.join(dataset_dir, txt_file)
+            if os.path.isfile(txt_path):
+                with open(txt_path, 'r') as f:
+                    existing_captions[txt_file] = f.read()
+
+        uncaptioned_count = len(image_files) - len(existing_captions)
+        if uncaptioned_count == 0:
+            update_task(task_id, status="complete", message="All images already have captions")
+            return
+
+        update_task(task_id, progress=f"0/{uncaptioned_count}",
+                    message=f"Running WD14 tagger on {uncaptioned_count} uncaptioned images...")
+
+        # Step 2: Run WD14 tagger on the directory
+        model_dir = os.path.join(sd_scripts, "wd14_models")
+        cmd = [
+            venv_python, tagger_script,
+            "--onnx",
+            "--batch_size", "4",
+            "--thresh", "0.35",
+            "--caption_extension", ".txt",
+            "--model_dir", model_dir,
+            dataset_dir,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if result.returncode != 0:
+            update_task(task_id, status="failed",
+                        error=f"Tagger failed: {result.stderr[:500]}")
+            return
+
+        # Step 3: Restore pre-existing captions
+        for txt_file, content in existing_captions.items():
+            txt_path = os.path.join(dataset_dir, txt_file)
+            with open(txt_path, 'w') as f:
+                f.write(content)
+
+        # Step 4: Cleanup newly-generated captions only
+        new_captions = 0
+        for img_file in image_files:
+            txt_file = os.path.splitext(img_file)[0] + '.txt'
+            if txt_file not in existing_captions:
+                txt_path = os.path.join(dataset_dir, txt_file)
+                if os.path.isfile(txt_path):
+                    with open(txt_path, 'r') as f:
+                        raw = f.read().strip()
+                    cleaned = cleanup_caption(raw, model)
+                    with open(txt_path, 'w') as f:
+                        f.write(cleaned)
+                    new_captions += 1
+                    update_task(task_id, progress=f"{new_captions}/{uncaptioned_count}")
+
+        update_task(task_id, status="complete",
+                    message=f"Tagged and cleaned {new_captions} new captions")
+
+    except subprocess.TimeoutExpired:
+        update_task(task_id, status="failed", error="Tagger timed out (10 min limit)")
+    except Exception as e:
+        update_task(task_id, status="failed", error=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Image listing and stats
+# ---------------------------------------------------------------------------
+
+IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+
+
+def get_images_with_categories(base_dir):
+    """Return flat list of images with category metadata."""
+    images = []
+    if not os.path.isdir(base_dir):
+        return images
+
+    for filename in sorted(os.listdir(base_dir)):
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in IMAGE_EXTENSIONS:
+            continue
+
+        txt_path = os.path.join(base_dir, os.path.splitext(filename)[0] + '.txt')
+        has_caption = os.path.isfile(txt_path)
+        caption = ""
+        category = "uncategorized"
+
+        if has_caption:
+            with open(txt_path, 'r') as f:
+                caption = f.read().strip()
+            category = categorize_caption(caption)
+
+        images.append({
+            "filename": filename,
+            "has_caption": has_caption,
+            "caption": caption,
+            "category": category,
+        })
+
+    return images
+
+
+def compute_stats(images):
+    """Compute category balance stats from image list."""
+    from collections import Counter
+    counts = Counter(img["category"] for img in images)
+    total = len(images)
+
+    stats = {}
+    for cat in CATEGORY_ORDER:
+        count = counts.get(cat, 0)
+        current_pct = (count / total * 100) if total > 0 else 0
+        ideal_pct = IDEAL_RATIO.get(cat, 0) * 100
+        ideal_count = round(IDEAL_RATIO.get(cat, 0) * total)
+        deficit = max(0, ideal_count - count)
+        stats[cat] = {
+            "count": count,
+            "current_pct": round(current_pct, 1),
+            "ideal_pct": ideal_pct,
+            "ideal_count": ideal_count,
+            "deficit": deficit,
+        }
+
+    # Front-facing ratio for full_body
+    facing_tags = ["looking_at_viewer", "looking at viewer", "facing viewer", "facing_viewer"]
+    fb_images = [img for img in images if img["category"] == "full_body"]
+    fb_facing = sum(1 for img in fb_images if any(t in img["caption"].lower() for t in facing_tags))
+    fb_total = len(fb_images)
+
+    # Suggested repeats
+    reps = 7 if total > 120 else 8 if total > 100 else 10 if total > 60 else 15
+
+    return {
+        "categories": stats,
+        "total": total,
+        "full_body_facing": fb_facing,
+        "full_body_total": fb_total,
+        "suggested_repeats": reps,
+    }
+
+
+# ---------------------------------------------------------------------------
+# HTTP Server
+# ---------------------------------------------------------------------------
+
+def make_handler(base_dir, model):
+
+    class Handler(BaseHTTPRequestHandler):
+
+        def log_message(self, format, *args):
+            # Only log errors
+            if args and '404' in str(args[0]):
+                super().log_message(format, *args)
+
+        def _read_body(self):
+            length = int(self.headers.get('Content-Length', 0))
+            if length > 1_000_000:  # 1MB limit
+                return {}
+            return json.loads(self.rfile.read(length).decode('utf-8'))
+
+        def _json_response(self, data, status=200):
+            self.send_response(status)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(data).encode())
+
+        def do_GET(self):
+            path = unquote(self.path)
+            if path == '/' or path == '':
+                self._serve_html()
+            elif path == '/api/images':
+                images = get_images_with_categories(base_dir)
+                stats = compute_stats(images)
+                self._json_response({"images": images, "stats": stats})
+            elif path.startswith('/api/caption/'):
+                self._get_caption(path[13:])
+            elif path.startswith('/api/tasks/'):
+                task_id = path[11:]
+                task = get_task(task_id)
+                if task:
+                    self._json_response(task)
+                else:
+                    self._json_response({"error": "Task not found"}, 404)
+            elif path == '/api/stats':
+                images = get_images_with_categories(base_dir)
+                self._json_response(compute_stats(images))
+            elif path == '/api/config':
+                self._json_response({
+                    "trigger": conf.get("TRIGGER", ""),
+                    "class": conf.get("CLASS", ""),
+                    "model": model,
+                    "dataset_path": os.path.abspath(base_dir),
+                    "subset_name": conf.get("SUBSET_NAME", ""),
+                })
+            elif path.startswith('/img/'):
+                self._serve_image(path[5:])
+            elif path == '/favicon.ico':
+                self.send_response(204)
+                self.end_headers()
+            else:
+                self.send_error(404)
+
+        def do_POST(self):
+            path = unquote(self.path)
+            if path == '/api/delete':
+                self._handle_delete(self._read_body())
+            elif path.startswith('/api/caption/'):
+                self._save_caption(path[13:], self._read_body())
+            elif path == '/api/tag':
+                self._handle_tag(self._read_body())
+            elif path == '/api/set-category':
+                self._handle_set_category(self._read_body())
+            else:
+                self.send_error(404)
+
+        def _serve_html(self):
+            html = SPA_HTML
+            html = html.replace('{{DATASET_DIR}}', os.path.abspath(base_dir))
+            html = html.replace('{{MODEL}}', model)
+            html = html.replace('{{CATEGORY_TAGS_JSON}}', json.dumps(CATEGORY_TAGS))
+            html = html.replace('{{CATEGORY_PRIMARY_TAG_JSON}}', json.dumps(CATEGORY_PRIMARY_TAG))
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html')
+            self.end_headers()
+            self.wfile.write(html.encode())
+
+        def _serve_image(self, rel_path):
+            filepath = os.path.join(base_dir, rel_path)
+            # Path traversal protection
+            filepath = os.path.abspath(filepath)
+            if not filepath.startswith(os.path.abspath(base_dir)):
+                self.send_error(403)
+                return
+            if not os.path.isfile(filepath):
+                self.send_error(404)
+                return
+            mime = mimetypes.guess_type(filepath)[0] or 'image/png'
+            self.send_response(200)
+            self.send_header('Content-Type', mime)
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            with open(filepath, 'rb') as f:
+                self.wfile.write(f.read())
+
+        def _get_caption(self, rel_path):
+            img_path = os.path.join(base_dir, rel_path)
+            img_path = os.path.abspath(img_path)
+            if not img_path.startswith(os.path.abspath(base_dir)):
+                self.send_error(403)
+                return
+            txt_path = os.path.splitext(img_path)[0] + '.txt'
+            caption = ''
+            if os.path.isfile(txt_path):
+                with open(txt_path, 'r') as f:
+                    caption = f.read().strip()
+            self._json_response({'caption': caption, 'file': rel_path})
+
+        def _save_caption(self, rel_path, data):
+            img_path = os.path.join(base_dir, rel_path)
+            img_path = os.path.abspath(img_path)
+            if not img_path.startswith(os.path.abspath(base_dir)):
+                self.send_error(403)
+                return
+            txt_path = os.path.splitext(img_path)[0] + '.txt'
+            caption = data.get('caption', '')
+            with open(txt_path, 'w') as f:
+                f.write(caption)
+            category = categorize_caption(caption)
+            print(f"  Saved caption: {os.path.basename(txt_path)} [{category}]")
+            self._json_response({'saved': True, 'file': rel_path, 'category': category})
+
+        def _handle_delete(self, data):
+            files = data.get('files', [])
+            deleted = []
+            for rel_path in files:
+                filepath = os.path.abspath(os.path.join(base_dir, rel_path))
+                if not filepath.startswith(os.path.abspath(base_dir)):
+                    continue
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+                    deleted.append(rel_path)
+                    print(f"  Deleted: {rel_path}")
+                    txt_path = os.path.splitext(filepath)[0] + '.txt'
+                    if os.path.isfile(txt_path):
+                        os.remove(txt_path)
+            self._json_response({'deleted': deleted})
+
+        def _handle_tag(self, data):
+            task_id = create_task("WD14 Tagger")
+            thread = threading.Thread(
+                target=run_tagger_task,
+                args=(task_id, os.path.abspath(base_dir), model),
+                daemon=True,
+            )
+            thread.start()
+            self._json_response({"task_id": task_id})
+
+        def _handle_set_category(self, data):
+            filename = data.get('filename', '')
+            new_category = data.get('category', '')
+            if new_category not in CATEGORY_PRIMARY_TAG:
+                self._json_response({"error": "Invalid category"}, 400)
+                return
+
+            filepath = os.path.abspath(os.path.join(base_dir, filename))
+            if not filepath.startswith(os.path.abspath(base_dir)):
+                self.send_error(403)
+                return
+
+            txt_path = os.path.splitext(filepath)[0] + '.txt'
+            caption = ''
+            if os.path.isfile(txt_path):
+                with open(txt_path, 'r') as f:
+                    caption = f.read().strip()
+
+            # Remove all existing category tags
+            tags = [t.strip() for t in caption.split(',')]
+            all_cat_tags = set()
+            for tag_list in CATEGORY_TAGS.values():
+                all_cat_tags.update(t.lower() for t in tag_list)
+
+            cleaned_tags = [t for t in tags if t.lower() not in all_cat_tags]
+
+            # Find insertion point: after the prefix
+            prefix = make_prefix(model)
+            prefix_tags = [t.strip() for t in prefix.split(',')]
+            prefix_len = len(prefix_tags)
+
+            # Insert the new category tag after the prefix
+            new_tag = CATEGORY_PRIMARY_TAG[new_category]
+            result_tags = cleaned_tags[:prefix_len] + [new_tag] + cleaned_tags[prefix_len:]
+            new_caption = ', '.join(t for t in result_tags if t)
+
+            with open(txt_path, 'w') as f:
+                f.write(new_caption)
+
+            print(f"  Set category: {filename} -> {new_category}")
+            self._json_response({
+                'saved': True,
+                'filename': filename,
+                'category': new_category,
+                'caption': new_caption,
+            })
+
+    return Handler
+
+
+# ---------------------------------------------------------------------------
+# SPA HTML/JS/CSS
+# ---------------------------------------------------------------------------
+
+SPA_HTML = '''<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dataset Prep</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #1a1a2e; color: #eee; }
+
+  /* Header */
+  .header { padding: 12px 20px; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 15px; }
+  .header h1 { font-size: 1.2em; white-space: nowrap; }
+  .header .meta { color: #888; font-size: 0.8em; }
+
+  /* Tabs */
+  .tabs { display: flex; border-bottom: 2px solid #333; padding: 0 10px; background: #16213e;
+          position: sticky; top: 0; z-index: 100; }
+  .tab { padding: 10px 18px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px;
+         font-size: 0.85em; color: #aaa; transition: all 0.15s; white-space: nowrap; user-select: none; }
+  .tab:hover { color: #eee; background: rgba(255,255,255,0.05); }
+  .tab.active { color: #f39c12; border-bottom-color: #f39c12; }
+  .tab .badge { background: #333; color: #aaa; padding: 1px 7px; border-radius: 10px; font-size: 0.8em; margin-left: 5px; }
+  .tab.active .badge { background: #f39c12; color: #1a1a2e; }
+
+  /* Toolbar */
+  .toolbar { padding: 10px 20px; border-bottom: 1px solid #333; display: flex; gap: 10px; align-items: center;
+             flex-wrap: wrap; background: #1a1a2e; position: sticky; top: 42px; z-index: 99; }
+  .toolbar button { padding: 7px 14px; border: none; border-radius: 6px; cursor: pointer; font-size: 0.85em; font-weight: 600; }
+  .btn-tag { background: #9b59b6; color: #fff; }
+  .btn-tag:hover { background: #8e44ad; }
+  .btn-tag:disabled { background: #555; cursor: not-allowed; }
+  .btn-delete { background: #e74c3c; color: #fff; }
+  .btn-delete:hover { background: #c0392b; }
+  .btn-delete:disabled { background: #555; cursor: not-allowed; }
+  .btn-select { background: #3498db; color: #fff; }
+  .btn-select:hover { background: #2980b9; }
+  .btn-refresh { background: #2ecc71; color: #fff; }
+  .btn-refresh:hover { background: #27ae60; }
+  .count { color: #f39c12; font-weight: bold; font-size: 0.85em; margin-left: auto; }
+
+  /* Gallery grid */
+  .gallery { padding: 15px 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .card { position: relative; border-radius: 8px; overflow: hidden; cursor: pointer; border: 3px solid transparent;
+          transition: border-color 0.15s, transform 0.1s; background: #16213e; }
+  .card:hover { transform: scale(1.02); }
+  .card.selected { border-color: #e74c3c; }
+  .card img { width: 100%; display: block; aspect-ratio: auto; }
+  .card .name { padding: 5px 8px; font-size: 0.7em; color: #aaa; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card .check { position: absolute; top: 8px; right: 8px; width: 22px; height: 22px; border-radius: 50%;
+                 background: rgba(0,0,0,0.6); border: 2px solid #fff; display: flex; align-items: center; justify-content: center; }
+  .card.selected .check { background: #e74c3c; }
+  .card.selected .check::after { content: "\\2715"; color: #fff; font-weight: bold; font-size: 12px; }
+  .card .caption-dot { position: absolute; top: 8px; left: 8px; width: 10px; height: 10px; border-radius: 50%;
+                       border: 1px solid rgba(0,0,0,0.3); }
+  .caption-dot.has { background: #2ecc71; }
+  .caption-dot.none { background: #e74c3c; }
+  .card .cat-label { position: absolute; bottom: 28px; left: 0; padding: 2px 8px; font-size: 0.65em;
+                     background: rgba(0,0,0,0.7); color: #f39c12; border-radius: 0 4px 4px 0; }
+
+  /* Modal */
+  .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95);
+           z-index: 200; }
+  .modal.active { display: flex; }
+  .modal-layout { display: flex; width: 100%; height: 100%; }
+  .modal-image { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; min-width: 0; }
+  .modal-image img { max-width: 100%; max-height: 100vh; object-fit: contain; }
+  .modal-sidebar { width: 420px; background: #16213e; display: flex; flex-direction: column; border-left: 1px solid #333; }
+  .modal-sidebar h3 { padding: 12px 15px; border-bottom: 1px solid #333; font-size: 0.9em; color: #f39c12; }
+  .modal-info { padding: 8px 15px; color: #888; font-size: 0.78em; border-bottom: 1px solid #333; }
+
+  /* Category quick-set buttons */
+  .category-buttons { padding: 10px 15px; border-bottom: 1px solid #333; display: flex; gap: 6px; flex-wrap: wrap; }
+  .category-buttons label { font-size: 0.7em; color: #888; margin-right: auto; width: 100%; margin-bottom: 2px; }
+  .cat-btn { padding: 6px 12px; border: 2px solid #555; border-radius: 6px; background: transparent;
+             color: #aaa; font-size: 0.78em; cursor: pointer; font-weight: 600; transition: all 0.15s; }
+  .cat-btn:hover { border-color: #f39c12; color: #f39c12; }
+  .cat-btn.active { border-color: #f39c12; background: #f39c12; color: #1a1a2e; }
+
+  /* Quick tag buttons */
+  .quick-tags { padding: 8px 15px; border-bottom: 1px solid #333; display: flex; flex-wrap: wrap; gap: 5px; }
+  .quick-tags label { font-size: 0.7em; color: #888; margin-right: auto; width: 100%; margin-bottom: 2px; }
+  .tag-btn { padding: 3px 9px; border: 1px solid #555; border-radius: 4px; background: #0f3460;
+             color: #aaa; font-size: 0.72em; cursor: pointer; transition: all 0.15s; }
+  .tag-btn:hover { border-color: #3498db; color: #fff; }
+  .tag-btn.active { background: #3498db; color: #fff; border-color: #3498db; }
+
+  /* Caption area */
+  .caption-area { flex: 1; padding: 12px 15px; display: flex; flex-direction: column; }
+  .caption-area textarea { flex: 1; background: #0f3460; color: #eee; border: 1px solid #333; border-radius: 6px;
+                           padding: 10px; font-family: monospace; font-size: 0.82em; resize: none; line-height: 1.5; }
+  .caption-area textarea:focus { outline: none; border-color: #3498db; }
+  .btn-row { display: flex; gap: 8px; padding-top: 10px; }
+  .btn-row button { flex: 1; padding: 10px; border: none; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.85em; }
+  .btn-save { background: #2ecc71; color: #fff; }
+  .btn-save:hover { background: #27ae60; }
+  .btn-save.dirty { background: #f39c12; }
+  .btn-modal-delete { background: #e74c3c; color: #fff; }
+  .btn-modal-delete:hover { background: #c0392b; }
+
+  .modal .close { position: absolute; top: 10px; right: 15px; color: #fff; font-size: 1.8em; cursor: pointer; z-index: 10; }
+  .modal .nav { position: absolute; top: 50%; color: #fff; font-size: 3em; cursor: pointer; padding: 20px;
+                user-select: none; transform: translateY(-50%); z-index: 10; }
+  .modal .nav.prev { left: 10px; }
+  .modal .nav.next { right: 10px; }
+
+  /* Stats view */
+  .stats-view { padding: 30px 40px; max-width: 800px; }
+  .stats-view h2 { margin-bottom: 20px; font-size: 1.2em; color: #f39c12; }
+  .stats-table { width: 100%; border-collapse: collapse; margin-bottom: 25px; }
+  .stats-table th { text-align: left; padding: 8px 12px; border-bottom: 2px solid #555; color: #aaa; font-size: 0.82em; }
+  .stats-table td { padding: 8px 12px; border-bottom: 1px solid #333; font-size: 0.85em; }
+  .stats-bar { height: 16px; border-radius: 3px; background: #333; overflow: hidden; min-width: 100px; }
+  .stats-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .stats-bar-fill.ok { background: #2ecc71; }
+  .stats-bar-fill.low { background: #f39c12; }
+  .stats-bar-fill.over { background: #3498db; }
+  .stats-bar-fill.warn { background: #e74c3c; }
+  .stats-summary { color: #aaa; font-size: 0.9em; line-height: 1.8; }
+  .stats-summary strong { color: #eee; }
+
+  /* Task progress bar */
+  .task-bar { position: fixed; bottom: 0; left: 0; right: 0; background: #16213e; border-top: 1px solid #333;
+              padding: 10px 20px; display: none; z-index: 300; align-items: center; gap: 15px; }
+  .task-bar.active { display: flex; }
+  .task-bar .task-label { font-size: 0.85em; white-space: nowrap; }
+  .task-bar .task-progress { flex: 1; height: 8px; background: #333; border-radius: 4px; overflow: hidden; }
+  .task-bar .task-fill { height: 100%; background: #9b59b6; border-radius: 4px; transition: width 0.3s; }
+  .task-bar .task-status { font-size: 0.8em; color: #aaa; }
+  .task-bar.complete .task-fill { background: #2ecc71; }
+  .task-bar.failed .task-fill { background: #e74c3c; }
+
+  /* Toast */
+  .toast { position: fixed; bottom: 60px; right: 20px; background: #2ecc71; color: #fff; padding: 12px 20px;
+           border-radius: 8px; font-weight: 600; z-index: 400; opacity: 0; transition: opacity 0.3s; font-size: 0.9em; }
+  .toast.show { opacity: 1; }
+  .toast.error { background: #e74c3c; }
+
+  /* Empty state */
+  .empty { text-align: center; padding: 60px 20px; color: #555; }
+  .empty p { font-size: 1.1em; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>Dataset Prep</h1>
+  <span class="meta" id="headerMeta">{{DATASET_DIR}} | {{MODEL}}</span>
+</div>
+
+<div class="tabs" id="tabBar">
+  <div class="tab active" data-tab="uncategorized" onclick="switchTab('uncategorized')">Uncategorized <span class="badge" id="badge-uncategorized">0</span></div>
+  <div class="tab" data-tab="face_closeup" onclick="switchTab('face_closeup')">Face Closeup <span class="badge" id="badge-face_closeup">0</span></div>
+  <div class="tab" data-tab="head_shoulders" onclick="switchTab('head_shoulders')">Head/Shoulders <span class="badge" id="badge-head_shoulders">0</span></div>
+  <div class="tab" data-tab="upper_body" onclick="switchTab('upper_body')">Upper Body <span class="badge" id="badge-upper_body">0</span></div>
+  <div class="tab" data-tab="full_body" onclick="switchTab('full_body')">Full Body <span class="badge" id="badge-full_body">0</span></div>
+  <div class="tab" data-tab="all" onclick="switchTab('all')">All <span class="badge" id="badge-all">0</span></div>
+  <div class="tab" data-tab="stats" onclick="switchTab('stats')">Stats</div>
+</div>
+
+<div class="toolbar" id="toolbar">
+  <button class="btn-tag" id="tagBtn" onclick="runTagger()">Tag Uncaptioned</button>
+  <button class="btn-delete" id="deleteBtn" disabled onclick="deleteSelected()">Delete (0)</button>
+  <button class="btn-select" onclick="selectAllVisible()">Select All</button>
+  <button class="btn-select" onclick="selectNone()">Select None</button>
+  <button class="btn-select" onclick="invertVisible()">Invert</button>
+  <button class="btn-refresh" onclick="loadImages()">Refresh</button>
+  <span class="count" id="totalCount"></span>
+</div>
+
+<div class="gallery" id="gallery">
+  <div class="grid" id="grid"></div>
+</div>
+
+<div class="stats-view" id="statsView" style="display:none;"></div>
+
+<div class="modal" id="modal">
+  <div class="modal-layout">
+    <div class="modal-image">
+      <span class="close" onclick="closeModal()">&times;</span>
+      <span class="nav prev" onclick="navModal(-1); event.stopPropagation();">&#8249;</span>
+      <img id="modalImg" src="">
+      <span class="nav next" onclick="navModal(1); event.stopPropagation();">&#8250;</span>
+    </div>
+    <div class="modal-sidebar">
+      <h3>Caption Editor</h3>
+      <div class="modal-info" id="modalInfo"></div>
+      <div class="category-buttons">
+        <label>Category</label>
+        <button class="cat-btn" data-cat="face_closeup" onclick="setCategory('face_closeup')">Face Closeup</button>
+        <button class="cat-btn" data-cat="head_shoulders" onclick="setCategory('head_shoulders')">Head/Shoulders</button>
+        <button class="cat-btn" data-cat="upper_body" onclick="setCategory('upper_body')">Upper Body</button>
+        <button class="cat-btn" data-cat="full_body" onclick="setCategory('full_body')">Full Body</button>
+      </div>
+      <div class="quick-tags" id="quickTags">
+        <label>Tags</label>
+      </div>
+      <div class="caption-area">
+        <textarea id="captionText" placeholder="No caption yet. Type tags and save to create one."
+                  oninput="onCaptionInput()"></textarea>
+        <div class="btn-row">
+          <button class="btn-save" id="saveBtn" onclick="saveCaption()">Save (Ctrl+S)</button>
+          <button class="btn-modal-delete" onclick="deleteCurrentInModal()">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="task-bar" id="taskBar">
+  <span class="task-label" id="taskLabel">Tagging...</span>
+  <div class="task-progress"><div class="task-fill" id="taskFill" style="width:0%"></div></div>
+  <span class="task-status" id="taskStatus"></span>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// --- Config injected from server ---
+const CATEGORY_TAGS = JSON.parse('{{CATEGORY_TAGS_JSON}}');
+const CATEGORY_PRIMARY_TAG = JSON.parse('{{CATEGORY_PRIMARY_TAG_JSON}}');
+const CATEGORY_ORDER = ['face_closeup', 'head_shoulders', 'upper_body', 'full_body', 'uncategorized'];
+const QUICK_TAGS = [
+  'looking_at_viewer', 'smile', 'standing', 'sitting', 'leaning',
+  'from_above', 'from_below', 'from_side', 'from_behind',
+  'outdoors', 'indoors', 'simple_background',
+];
+
+// --- State ---
+let allImages = [];       // [{filename, has_caption, caption, category}, ...]
+let filteredImages = [];   // Current tab's subset
+let selected = new Set();  // Selected filenames
+let activeTab = 'uncategorized';
+let modalIdx = -1;         // Index into filteredImages
+let isDirty = false;
+let originalCaption = '';
+let currentStats = null;
+let activeTaskId = null;
+
+// --- Category detection (mirrors Python) ---
+function categorizeCaption(text) {
+  const lower = text.toLowerCase();
+  const checkOrder = ['face_closeup', 'upper_body', 'full_body', 'head_shoulders'];
+  for (const cat of checkOrder) {
+    for (const tag of CATEGORY_TAGS[cat]) {
+      if (lower.includes(tag)) return cat;
+    }
+  }
+  return 'uncategorized';
+}
+
+// --- Tab management ---
+function switchTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+
+  const isStats = tab === 'stats';
+  document.getElementById('gallery').style.display = isStats ? 'none' : '';
+  document.getElementById('toolbar').style.display = isStats ? 'none' : '';
+  document.getElementById('statsView').style.display = isStats ? '' : 'none';
+
+  if (isStats) {
+    renderStats();
+  } else {
+    renderGrid();
+  }
+}
+
+function updateBadges() {
+  const counts = {};
+  let total = 0;
+  for (const cat of CATEGORY_ORDER) counts[cat] = 0;
+  for (const img of allImages) {
+    counts[img.category] = (counts[img.category] || 0) + 1;
+    total++;
+  }
+  for (const cat of CATEGORY_ORDER) {
+    const badge = document.getElementById('badge-' + cat);
+    if (badge) badge.textContent = counts[cat] || 0;
+  }
+  document.getElementById('badge-all').textContent = total;
+  document.getElementById('totalCount').textContent = total + ' images';
+}
+
+// --- Data loading ---
+async function loadImages() {
+  try {
+    const resp = await fetch('/api/images');
+    const data = await resp.json();
+    allImages = data.images;
+    currentStats = data.stats;
+    updateBadges();
+    if (activeTab === 'stats') renderStats();
+    else renderGrid();
+  } catch (e) {
+    showToast('Failed to load images: ' + e.message, true);
+  }
+}
+
+// --- Grid rendering ---
+function renderGrid() {
+  if (activeTab === 'all') {
+    filteredImages = [...allImages];
+  } else {
+    filteredImages = allImages.filter(img => img.category === activeTab);
+  }
+
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+
+  if (filteredImages.length === 0) {
+    grid.innerHTML = '<div class="empty"><p>No images in this category</p></div>';
+    return;
+  }
+
+  for (let i = 0; i < filteredImages.length; i++) {
+    const img = filteredImages[i];
+    const card = document.createElement('div');
+    card.className = 'card' + (selected.has(img.filename) ? ' selected' : '');
+    card.dataset.idx = i;
+    card.dataset.filename = img.filename;
+    card.onclick = (e) => { if (e.shiftKey) openModal(i); else toggleSelect(img.filename); };
+    card.ondblclick = () => openModal(i);
+
+    const imgEl = document.createElement('img');
+    imgEl.loading = 'lazy';
+    imgEl.src = '/img/' + encodeURIComponent(img.filename);
+
+    const check = document.createElement('div');
+    check.className = 'check';
+
+    const dot = document.createElement('div');
+    dot.className = 'caption-dot ' + (img.has_caption ? 'has' : 'none');
+
+    if (activeTab === 'all' && img.category !== 'uncategorized') {
+      const catLabel = document.createElement('div');
+      catLabel.className = 'cat-label';
+      catLabel.textContent = img.category.replace('_', ' ');
+      card.appendChild(catLabel);
+    }
+
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = img.filename;
+
+    card.appendChild(imgEl);
+    card.appendChild(check);
+    card.appendChild(dot);
+    card.appendChild(name);
+    grid.appendChild(card);
+  }
+  updateToolbar();
+}
+
+// --- Selection ---
+function toggleSelect(filename) {
+  if (selected.has(filename)) selected.delete(filename); else selected.add(filename);
+  updateCardSelection(filename);
+  updateToolbar();
+}
+
+function selectAllVisible() {
+  filteredImages.forEach(img => selected.add(img.filename));
+  updateAllCardSelections();
+  updateToolbar();
+}
+
+function selectNone() {
+  selected.clear();
+  updateAllCardSelections();
+  updateToolbar();
+}
+
+function invertVisible() {
+  filteredImages.forEach(img => {
+    if (selected.has(img.filename)) selected.delete(img.filename);
+    else selected.add(img.filename);
+  });
+  updateAllCardSelections();
+  updateToolbar();
+}
+
+function updateCardSelection(filename) {
+  const card = document.querySelector(`.card[data-filename="${CSS.escape(filename)}"]`);
+  if (card) card.classList.toggle('selected', selected.has(filename));
+}
+
+function updateAllCardSelections() {
+  document.querySelectorAll('.card').forEach(card => {
+    card.classList.toggle('selected', selected.has(card.dataset.filename));
+  });
+}
+
+function updateToolbar() {
+  const btn = document.getElementById('deleteBtn');
+  btn.disabled = selected.size === 0;
+  btn.textContent = `Delete (${selected.size})`;
+}
+
+// --- Delete ---
+async function deleteSelected() {
+  if (selected.size === 0) return;
+  if (!confirm(`Delete ${selected.size} image(s)? Cannot undo.`)) return;
+  const files = Array.from(selected);
+  try {
+    const resp = await fetch('/api/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({files})
+    });
+    const result = await resp.json();
+    showToast(`Deleted ${result.deleted.length} images`);
+    selected.clear();
+    loadImages();
+  } catch (e) { showToast('Delete failed: ' + e.message, true); }
+}
+
+// --- Modal ---
+async function openModal(idx) {
+  if (isDirty && !confirm('Unsaved caption changes. Discard?')) return;
+  isDirty = false;
+
+  modalIdx = idx;
+  const img = filteredImages[idx];
+  if (!img) return;
+
+  document.getElementById('modalImg').src = '/img/' + encodeURIComponent(img.filename);
+  document.getElementById('modalInfo').textContent = img.filename + ' (' + (idx + 1) + '/' + filteredImages.length + ')';
+  document.getElementById('modal').classList.add('active');
+
+  // Load fresh caption
+  try {
+    const resp = await fetch('/api/caption/' + encodeURIComponent(img.filename));
+    const data = await resp.json();
+    document.getElementById('captionText').value = data.caption || '';
+    originalCaption = data.caption || '';
+  } catch {
+    document.getElementById('captionText').value = '';
+    originalCaption = '';
+  }
+
+  updateModalCategoryButtons();
+  updateModalTagButtons();
+  document.getElementById('saveBtn').className = 'btn-save';
+  document.getElementById('saveBtn').textContent = 'Save (Ctrl+S)';
+  document.getElementById('captionText').focus();
+}
+
+function closeModal() {
+  if (isDirty && !confirm('Unsaved caption changes. Discard?')) return;
+  isDirty = false;
+  document.getElementById('modal').classList.remove('active');
+}
+
+function navModal(dir) {
+  if (isDirty && !confirm('Unsaved caption changes. Discard?')) return;
+  isDirty = false;
+  const len = filteredImages.length;
+  if (len === 0) return;
+  modalIdx = (modalIdx + dir + len) % len;
+  openModal(modalIdx);
+}
+
+function onCaptionInput() {
+  const current = document.getElementById('captionText').value;
+  isDirty = current !== originalCaption;
+  document.getElementById('saveBtn').className = isDirty ? 'btn-save dirty' : 'btn-save';
+  document.getElementById('saveBtn').textContent = isDirty ? 'Save * (Ctrl+S)' : 'Save (Ctrl+S)';
+  updateModalCategoryButtons();
+  updateModalTagButtons();
+}
+
+// --- Category buttons ---
+function updateModalCategoryButtons() {
+  const caption = document.getElementById('captionText').value;
+  const currentCat = categorizeCaption(caption);
+  document.querySelectorAll('.cat-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.cat === currentCat);
+  });
+}
+
+async function setCategory(cat) {
+  const img = filteredImages[modalIdx];
+  if (!img) return;
+
+  try {
+    const resp = await fetch('/api/set-category', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename: img.filename, category: cat})
+    });
+    const result = await resp.json();
+    if (result.saved) {
+      document.getElementById('captionText').value = result.caption;
+      originalCaption = result.caption;
+      isDirty = false;
+      document.getElementById('saveBtn').className = 'btn-save';
+      document.getElementById('saveBtn').textContent = 'Save (Ctrl+S)';
+
+      // Update local state
+      img.caption = result.caption;
+      img.category = result.category;
+      img.has_caption = true;
+      const allImg = allImages.find(i => i.filename === img.filename);
+      if (allImg) { allImg.caption = result.caption; allImg.category = result.category; allImg.has_caption = true; }
+
+      updateBadges();
+      updateModalCategoryButtons();
+      updateModalTagButtons();
+      showToast('Category: ' + cat.replace('_', ' '));
+    }
+  } catch (e) { showToast('Failed: ' + e.message, true); }
+}
+
+// --- Quick tag buttons ---
+function updateModalTagButtons() {
+  const caption = document.getElementById('captionText').value.toLowerCase();
+  const container = document.getElementById('quickTags');
+  // Keep the label, rebuild buttons
+  container.innerHTML = '<label>Tags</label>';
+
+  for (const tag of QUICK_TAGS) {
+    const btn = document.createElement('button');
+    btn.className = 'tag-btn' + (caption.includes(tag.toLowerCase()) ? ' active' : '');
+    btn.textContent = tag;
+    btn.onclick = () => toggleTag(tag);
+    container.appendChild(btn);
+  }
+}
+
+function toggleTag(tag) {
+  const textarea = document.getElementById('captionText');
+  let text = textarea.value;
+  const tags = text.split(',').map(t => t.trim()).filter(t => t);
+
+  const idx = tags.findIndex(t => t.toLowerCase() === tag.toLowerCase());
+  if (idx >= 0) {
+    tags.splice(idx, 1);
+  } else {
+    tags.push(tag);
+  }
+
+  textarea.value = tags.join(', ');
+  onCaptionInput();
+  textarea.focus();
+}
+
+// --- Save caption ---
+async function saveCaption() {
+  const caption = document.getElementById('captionText').value;
+  const img = filteredImages[modalIdx];
+  if (!img) return;
+
+  try {
+    const resp = await fetch('/api/caption/' + encodeURIComponent(img.filename), {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({caption})
+    });
+    const result = await resp.json();
+    originalCaption = caption;
+    isDirty = false;
+    document.getElementById('saveBtn').className = 'btn-save';
+    document.getElementById('saveBtn').textContent = 'Save (Ctrl+S)';
+
+    // Update local state with new category
+    const newCat = result.category || categorizeCaption(caption);
+    img.caption = caption;
+    img.category = newCat;
+    img.has_caption = true;
+    const allImg = allImages.find(i => i.filename === img.filename);
+    if (allImg) { allImg.caption = caption; allImg.category = newCat; allImg.has_caption = true; }
+
+    updateBadges();
+    updateModalCategoryButtons();
+    showToast('Saved');
+  } catch (e) { showToast('Save failed: ' + e.message, true); }
+}
+
+// --- Delete in modal ---
+async function deleteCurrentInModal() {
+  const img = filteredImages[modalIdx];
+  if (!img) return;
+  if (!confirm('Delete this image? Cannot undo.')) return;
+
+  try {
+    await fetch('/api/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({files: [img.filename]})
+    });
+    isDirty = false;
+    showToast('Deleted');
+
+    // Remove from arrays
+    allImages = allImages.filter(i => i.filename !== img.filename);
+    filteredImages.splice(modalIdx, 1);
+    selected.delete(img.filename);
+
+    if (filteredImages.length === 0) { closeModal(); renderGrid(); updateBadges(); return; }
+    if (modalIdx >= filteredImages.length) modalIdx = filteredImages.length - 1;
+    openModal(modalIdx);
+    updateBadges();
+  } catch (e) { showToast('Delete failed', true); }
+}
+
+// --- WD14 Tagger ---
+async function runTagger() {
+  if (activeTaskId) { showToast('A task is already running', true); return; }
+  const uncaptioned = allImages.filter(img => !img.has_caption).length;
+  if (uncaptioned === 0) { showToast('All images already have captions'); return; }
+  if (!confirm(`Run WD14 tagger on ${uncaptioned} uncaptioned image(s)?`)) return;
+
+  const btn = document.getElementById('tagBtn');
+  btn.disabled = true;
+  btn.textContent = 'Tagging...';
+
+  try {
+    const resp = await fetch('/api/tag', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({})
+    });
+    const data = await resp.json();
+    activeTaskId = data.task_id;
+    pollTask(activeTaskId);
+  } catch (e) {
+    showToast('Failed to start tagger: ' + e.message, true);
+    btn.disabled = false;
+    btn.textContent = 'Tag Uncaptioned';
+  }
+}
+
+function pollTask(taskId) {
+  const bar = document.getElementById('taskBar');
+  bar.className = 'task-bar active';
+
+  const poll = async () => {
+    try {
+      const resp = await fetch('/api/tasks/' + taskId);
+      const task = await resp.json();
+
+      document.getElementById('taskLabel').textContent = task.name || 'Task';
+      document.getElementById('taskStatus').textContent = task.message || '';
+
+      // Parse progress for bar width
+      const match = (task.progress || '').match(new RegExp('^([0-9]+)/([0-9]+)$'));
+      if (match) {
+        const pct = Math.round((parseInt(match[1]) / parseInt(match[2])) * 100);
+        document.getElementById('taskFill').style.width = pct + '%';
+      }
+
+      if (task.status === 'running') {
+        setTimeout(poll, 2000);
+      } else {
+        // Done
+        bar.className = 'task-bar active ' + (task.status === 'complete' ? 'complete' : 'failed');
+        document.getElementById('taskFill').style.width = '100%';
+
+        if (task.error) {
+          document.getElementById('taskStatus').textContent = 'Error: ' + task.error;
+          showToast('Tagger failed: ' + task.error, true);
+        } else {
+          showToast(task.message || 'Done');
+        }
+
+        activeTaskId = null;
+        document.getElementById('tagBtn').disabled = false;
+        document.getElementById('tagBtn').textContent = 'Tag Uncaptioned';
+
+        // Refresh images
+        loadImages();
+
+        // Auto-hide bar after 4 seconds
+        setTimeout(() => { bar.className = 'task-bar'; }, 4000);
+      }
+    } catch (e) {
+      activeTaskId = null;
+      bar.className = 'task-bar';
+      document.getElementById('tagBtn').disabled = false;
+      document.getElementById('tagBtn').textContent = 'Tag Uncaptioned';
+    }
+  };
+  poll();
+}
+
+// --- Stats rendering ---
+function renderStats() {
+  if (!currentStats) return;
+  const s = currentStats;
+  const view = document.getElementById('statsView');
+
+  let html = '<h2>Dataset Balance</h2>';
+  html += '<table class="stats-table"><tr><th>Category</th><th>Count</th><th>Current</th><th>Ideal</th><th></th><th>Status</th></tr>';
+
+  const catLabels = {
+    face_closeup: 'Face Closeup', head_shoulders: 'Head/Shoulders',
+    upper_body: 'Upper Body', full_body: 'Full Body', uncategorized: 'Uncategorized'
+  };
+
+  for (const cat of CATEGORY_ORDER) {
+    const c = s.categories[cat];
+    if (!c) continue;
+    const pct = c.current_pct;
+    const ideal = c.ideal_pct;
+    let barClass = 'ok';
+    if (cat === 'uncategorized' && c.count > 0) barClass = 'warn';
+    else if (pct < ideal - 5) barClass = 'low';
+    else if (pct > ideal + 10) barClass = 'over';
+
+    const barWidth = Math.min(100, Math.round((pct / Math.max(ideal, 1)) * 100));
+    let status = '';
+    if (cat === 'uncategorized' && c.count > 0) status = 'tag these';
+    else if (c.deficit > 0) status = 'need +' + c.deficit;
+    else status = 'ok';
+
+    html += `<tr>
+      <td>${catLabels[cat] || cat}</td>
+      <td>${c.count}</td>
+      <td>${pct}%</td>
+      <td>${ideal}%</td>
+      <td><div class="stats-bar"><div class="stats-bar-fill ${barClass}" style="width:${barWidth}%"></div></div></td>
+      <td>${status}</td>
+    </tr>`;
+  }
+  html += '</table>';
+
+  html += '<div class="stats-summary">';
+  html += `<strong>Total images:</strong> ${s.total}<br>`;
+  html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.total * s.suggested_repeats} steps/epoch)<br>`;
+  if (s.full_body_total > 0) {
+    const fbPct = Math.round(s.full_body_facing / s.full_body_total * 100);
+    html += `<strong>Full body facing camera:</strong> ${s.full_body_facing}/${s.full_body_total} (${fbPct}%)`;
+    const target = Math.round(s.full_body_total * 0.7);
+    if (s.full_body_facing < target) {
+      html += ` — need ~${target - s.full_body_facing} more front-facing`;
+    }
+    html += '<br>';
+  }
+  html += '</div>';
+
+  view.innerHTML = html;
+}
+
+// --- Keyboard shortcuts ---
+document.addEventListener('keydown', (e) => {
+  const modal = document.getElementById('modal');
+  if (!modal.classList.contains('active')) return;
+
+  const inTextarea = document.activeElement === document.getElementById('captionText');
+
+  if (e.key === 'Escape') { closeModal(); e.preventDefault(); }
+  if (e.ctrlKey && e.key === 's') { saveCaption(); e.preventDefault(); }
+
+  if (!inTextarea) {
+    if (e.key === 'ArrowLeft') navModal(-1);
+    if (e.key === 'ArrowRight') navModal(1);
+    if (e.key === 'd' || e.key === 'Delete') { toggleSelect(filteredImages[modalIdx]?.filename); navModal(1); }
+  }
+});
+
+// --- Toast ---
+function showToast(msg, isError) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.className = 'toast show' + (isError ? ' error' : '');
+  setTimeout(() => toast.className = 'toast', 3000);
+}
+
+// --- Init ---
+loadImages();
+</script>
+</body>
+</html>'''
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Dataset preparation server for LoRA training")
+    parser.add_argument("--model", required=True, choices=["pony", "lustify"],
+                        help="Base model (determines caption prefix)")
+    parser.add_argument("--dir", default=None,
+                        help="Dataset directory (default: from project.conf)")
+    parser.add_argument("--port", type=int, default=8899, help="Port (default: 8899)")
+    args = parser.parse_args()
+
+    dataset_dir = args.dir or conf.get("DATASET_PATH", "dataset/img")
+    if not os.path.isdir(dataset_dir):
+        print(f"Error: '{dataset_dir}' not found. Run setup.sh first.")
+        sys.exit(1)
+
+    handler = make_handler(dataset_dir, args.model)
+    server = HTTPServer(('0.0.0.0', args.port), handler)
+
+    img_count = sum(1 for f in os.listdir(dataset_dir)
+                    if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS)
+    txt_count = sum(1 for f in os.listdir(dataset_dir) if f.endswith('.txt'))
+
+    print(f"Dataset Prep Server")
+    print(f"  Model:     {args.model}")
+    print(f"  Directory: {os.path.abspath(dataset_dir)}")
+    print(f"  Images:    {img_count} ({txt_count} captioned)")
+    print(f"  URL:       http://0.0.0.0:{args.port}")
+    print()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

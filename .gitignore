@@ -1,0 +1,1 @@
+dataset/\nraw_images/\noutputs/\nlogs/\nsamples/\n__pycache__/\n*.pyc\n.config_*.toml\n.sample_prompts_*.txt
