@@ -386,7 +386,7 @@ def main():
                         help="LoRA to apply. Format: name:weight (e.g. 'klb_y1_pony_v1:0.7'). Can specify multiple times. Stacks with LORAS in project.conf.")
     parser.add_argument("--url", default=A1111_URL)
     parser.add_argument("--category", choices=["face_closeup", "head_shoulders", "upper_body", "full_body"])
-    parser.add_argument("--output", default="raw_images")
+    parser.add_argument("--output", default=conf.get("DATASET_PATH", "raw_images"))
     parser.add_argument("--add", type=int, default=0,
                         help="Generate N additional images per category (appends, doesn't overwrite)")
     parser.add_argument("--dry-run", action="store_true")
