@@ -481,8 +481,11 @@ def make_handler(base_dir, model):
             self.send_header('Content-Type', mime)
             self.send_header('Cache-Control', 'no-cache')
             self.end_headers()
-            with open(filepath, 'rb') as f:
-                self.wfile.write(f.read())
+            try:
+                with open(filepath, 'rb') as f:
+                    self.wfile.write(f.read())
+            except BrokenPipeError:
+                pass
 
         def _get_caption(self, rel_path):
             img_path = os.path.join(base_dir, rel_path)
