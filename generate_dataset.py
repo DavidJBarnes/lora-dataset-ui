@@ -455,12 +455,17 @@ def main():
 
     total = sum(c["count"] for c in cats.values())
 
+    output_dir = args.output
+    os.makedirs(output_dir, exist_ok=True)
+
     mode = f"ADD {args.add} per category" if args.add > 0 else "FULL"
     print(f"\n{'=' * 60}")
+    print(f"  Output: {output_dir}")
     print(f"  Mode: {mode}")
     for name, cat in cats.items():
-        cat_dir = os.path.join(args.output, name)
-        existing = len([f for f in os.listdir(cat_dir) if f.endswith(".png")]) if os.path.isdir(cat_dir) else 0
+        # Count existing images for this category prefix in the flat directory
+        prefix = f"{name}_"
+        existing = len([f for f in os.listdir(output_dir) if f.startswith(prefix) and f.endswith(".png")])
         label = f"(+{cat['count']} new, {existing} existing)" if args.add > 0 else f"({len(cat['prompts'])} prompts)"
         print(f"  {name:<20} {cat['count']:>3} images at {cat['width']}×{cat['height']}  {label}")
     print(f"  Total to generate: {total} images")
@@ -479,14 +484,11 @@ def main():
     start = time.time()
 
     for cat_name, cat in cats.items():
-        cat_dir = os.path.join(args.output, cat_name)
-        os.makedirs(cat_dir, exist_ok=True)
-
-        # Find highest existing file number to continue from
+        # Find highest existing file number for this category in the flat directory
         existing_nums = []
-        for f in os.listdir(cat_dir):
-            if f.endswith(".png"):
-                # Extract number from end of filename (before .png)
+        prefix = f"{cat_name}_"
+        for f in os.listdir(output_dir):
+            if f.startswith(prefix) and f.endswith(".png"):
                 parts = f.replace(".png", "").rsplit("_", 1)
                 if len(parts) == 2:
                     try:
@@ -508,7 +510,7 @@ def main():
                 count += 1
                 file_idx = start_idx + count
                 fn = f"{cat_name}_{p['name']}_{file_idx:03d}.png"
-                fp = os.path.join(cat_dir, fn)
+                fp = os.path.join(output_dir, fn)
                 print(f"  [{count}/{cat['count']}] {fn} ... ", end="", flush=True)
                 try:
                     positive = p["positive"]
