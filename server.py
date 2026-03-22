@@ -482,7 +482,7 @@ def get_images_with_categories(base_dir):
     return images
 
 
-MAX_RECOMMENDED = 80  # Character LoRAs: 20-80 images is the sweet spot
+MAX_RECOMMENDED = 50  # Character LoRAs: 30-50 images is the sweet spot
 
 
 def compute_stats(images):
@@ -1608,7 +1608,7 @@ function renderStats() {
     html += ` <span style="color:#e74c3c">(over ${s.max_recommended} recommended max — risk of overfitting)</span>`;
   }
   html += '<br>';
-  html += `<strong>Recommended:</strong> 20\u201380 images for character LoRAs<br>`;
+  html += `<strong>Recommended:</strong> 30\u201350 images for character LoRAs<br>`;
   html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.total * s.suggested_repeats} steps/epoch, aim for 200\u2013400)<br>`;
   if (s.full_body_total > 0) {
     const fbPct = Math.round(s.full_body_facing / s.full_body_total * 100);
