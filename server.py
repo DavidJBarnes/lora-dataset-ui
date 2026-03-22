@@ -1568,6 +1568,8 @@ async function switchProject(name) {
       showToast('Switched to ' + name);
       loadImages();
       if (activeTab === 'config') loadConfig();
+      else if (activeTab === 'training') loadTraining();
+      else if (activeTab === 'stats') loadImages().then(() => renderStats());
     } else {
       showToast('Switch failed: ' + (data.error || 'unknown'), true);
     }
