@@ -9,3 +9,4 @@ __pycache__/
 .sample_prompts_*.txt
 server.conf
 training_runs.json
+.training.*

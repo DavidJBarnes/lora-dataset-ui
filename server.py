@@ -566,63 +566,103 @@ def list_sample_images(project_dir):
                   if os.path.splitext(f)[1].lower() in exts)
 
 
-def run_training_task(task_id, run_id, project_dir, model_type, conf):
-    """Background task: launch training and parse output in real time."""
-    global _active_training
+def _training_log_path(project_dir):
+    """Path to the live training log file."""
+    return os.path.join(project_dir, ".training.log")
+
+
+def _training_pid_path(project_dir):
+    """Path to the training PID file."""
+    return os.path.join(project_dir, ".training.pid")
+
+
+def _training_meta_path(project_dir):
+    """Path to the training metadata file (run_id, model, task_id, etc.)."""
+    return os.path.join(project_dir, ".training.json")
+
+
+def start_training_process(project_dir, model_type, run_id, task_id, conf):
+    """Launch training as a detached process that survives server restarts."""
+    train_script = os.path.join(project_dir, "train_character.sh")
+    if not os.path.isfile(train_script):
+        return None, "train_character.sh not found"
+
+    sd_scripts = conf.get("SD_SCRIPTS", "")
+    if not sd_scripts or not os.path.isdir(sd_scripts):
+        return None, "SD_SCRIPTS path not found"
+
+    log_path = _training_log_path(project_dir)
+    pid_path = _training_pid_path(project_dir)
+    meta_path = _training_meta_path(project_dir)
+
+    # Write training metadata
+    with open(meta_path, 'w') as f:
+        json.dump({
+            "run_id": run_id, "task_id": task_id,
+            "model_type": model_type, "project_dir": project_dir,
+            "started_at": datetime.datetime.now().isoformat(),
+            "conf_snapshot": {
+                "learning_rate": conf.get("LEARNING_RATE", "1e-4"),
+                "network_dim": conf.get("NETWORK_DIM", "32"),
+                "network_alpha": conf.get("NETWORK_ALPHA", "16"),
+                "num_repeats": conf.get("NUM_REPEATS", "10"),
+            },
+        }, f)
+
+    # Launch detached: output goes to log file, process gets its own session
+    log_file = open(log_path, 'w')
+    proc = subprocess.Popen(
+        ["bash", train_script, model_type],
+        cwd=project_dir,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,  # Survives server restart
+    )
+    log_file.close()  # The child process inherited the fd
+
+    # Write PID
+    with open(pid_path, 'w') as f:
+        f.write(str(proc.pid))
+
+    return proc.pid, None
+
+
+def check_training_alive(project_dir):
+    """Check if a training process is still running. Returns PID or None."""
+    pid_path = _training_pid_path(project_dir)
+    if not os.path.isfile(pid_path):
+        return None
+    with open(pid_path, 'r') as f:
+        pid = int(f.read().strip())
+    try:
+        os.kill(pid, 0)  # Check if process exists
+        return pid
+    except (ProcessLookupError, PermissionError):
+        return None
+
+
+def parse_training_log(project_dir):
+    """Parse the training log file and return current state."""
+    log_path = _training_log_path(project_dir)
+    if not os.path.isfile(log_path):
+        return {}
 
     loss_history = []
-    checkpoints = []
     current_epoch = 0
     total_epochs = 0
+    step = 0
     total_steps = 0
+    avg_loss = None
+    elapsed = ""
+    eta = ""
     last_loss_step = -1
+    log_tail = []
 
-    try:
-        sd_scripts = conf.get("SD_SCRIPTS", "")
-        if not sd_scripts or not os.path.isdir(sd_scripts):
-            update_task(task_id, status="failed", error="SD_SCRIPTS path not found")
-            return
-
-        train_script = os.path.join(project_dir, "train_character.sh")
-        if not os.path.isfile(train_script):
-            update_task(task_id, status="failed", error="train_character.sh not found")
-            return
-
-        update_task(task_id, message="Launching training...",
-                    training={"run_id": run_id, "model": model_type,
-                              "epoch": 0, "total_epochs": 0,
-                              "step": 0, "total_steps": 0,
-                              "avg_loss": None, "loss_history": [],
-                              "checkpoints": [], "samples": [],
-                              "elapsed": "", "eta": ""})
-
-        # Launch training subprocess
-        env = os.environ.copy()
-        proc = subprocess.Popen(
-            ["bash", train_script, model_type],
-            cwd=project_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=env,
-            bufsize=0,
-        )
-
-        with _training_lock:
-            if _active_training:
-                _active_training["process"] = proc
-
-        # Read output character by character to handle tqdm \r overwrites
-        line_buf = ""
-        log_tail = []  # Last 20 lines for error reporting
-        while True:
-            chunk = proc.stdout.read(1)
-            if not chunk:
-                break
-            ch = chunk.decode('utf-8', errors='replace')
-
-            if ch == '\r' or ch == '\n':
-                line = line_buf.strip()
-                line_buf = ""
+    with open(log_path, 'r', errors='replace') as f:
+        for raw_line in f:
+            # Handle tqdm \r lines — take the last segment
+            for part in raw_line.split('\r'):
+                line = part.strip()
                 if not line:
                     continue
 
@@ -630,107 +670,124 @@ def run_training_task(task_id, run_id, project_dir, model_type, conf):
                 if len(log_tail) > 20:
                     log_tail.pop(0)
 
-                # Parse epoch marker
                 m = _RE_EPOCH.search(line)
                 if m:
                     current_epoch = int(m.group(1))
                     total_epochs = int(m.group(2))
 
-                # Parse step progress + loss
                 m = _RE_STEP.search(line)
                 if m:
                     step = int(m.group(1))
                     total_steps = int(m.group(2))
                     avg_loss = float(m.group(3))
-
-                    # Sample loss history every ~10 steps
                     if step - last_loss_step >= 10:
                         loss_history.append({"step": step, "loss": avg_loss})
                         last_loss_step = step
-
-                    # Parse elapsed/eta from tqdm bracket
-                    elapsed = ""
-                    eta = ""
                     bracket = re.search(r'\[(\d+:\d+)<(\d+:\d+)', line)
                     if bracket:
                         elapsed = bracket.group(1)
                         eta = bracket.group(2)
 
-                    update_task(task_id,
-                                progress=f"{step}/{total_steps}",
-                                message=f"Epoch {current_epoch}/{total_epochs} — Step {step}/{total_steps} — Loss: {avg_loss:.4f}",
-                                training={"run_id": run_id, "model": model_type,
-                                          "epoch": current_epoch, "total_epochs": total_epochs,
-                                          "step": step, "total_steps": total_steps,
-                                          "avg_loss": avg_loss,
-                                          "loss_history": loss_history[-200:],
-                                          "checkpoints": checkpoints,
-                                          "samples": list_sample_images(project_dir),
-                                          "elapsed": elapsed, "eta": eta})
-                else:
-                    # Check for loss in simpler format
-                    m2 = _RE_LOSS_SIMPLE.search(line)
-                    if m2:
-                        avg_loss = float(m2.group(1))
+    return {
+        "epoch": current_epoch, "total_epochs": total_epochs,
+        "step": step, "total_steps": total_steps,
+        "avg_loss": avg_loss, "loss_history": loss_history[-200:],
+        "elapsed": elapsed, "eta": eta, "log_tail": log_tail,
+    }
 
-                # Detect checkpoint saves
-                if 'model saved' in line.lower() or 'saving model' in line.lower():
-                    new_files = list_lora_files(project_dir)
-                    checkpoints = new_files
 
-            else:
-                line_buf += ch
+def finalize_training(project_dir):
+    """Called when training process has finished. Save run history, clean up."""
+    meta_path = _training_meta_path(project_dir)
+    pid_path = _training_pid_path(project_dir)
+    log_path = _training_log_path(project_dir)
 
-        proc.wait()
-        exit_code = proc.returncode
+    if not os.path.isfile(meta_path):
+        return
 
-        # Gather final outputs
-        final_checkpoints = list_lora_files(project_dir)
-        final_samples = list_sample_images(project_dir)
-        final_loss = loss_history[-1]["loss"] if loss_history else None
+    with open(meta_path, 'r') as f:
+        meta = json.load(f)
 
-        if exit_code == 0:
-            update_task(task_id, status="complete",
-                        message=f"Training complete — {total_epochs} epochs, final loss: {final_loss:.4f}" if final_loss else "Training complete",
+    parsed = parse_training_log(project_dir)
+    final_loss = parsed.get("avg_loss")
+    total_epochs = parsed.get("total_epochs", 0)
+    total_steps = parsed.get("total_steps", 0)
+
+    # Determine success: if we got any epochs, likely succeeded
+    pid = check_training_alive(project_dir)
+    status = "complete" if pid is None and total_epochs > 0 else "failed"
+
+    run_data = {
+        "run_id": meta["run_id"],
+        "model_type": meta["model_type"],
+        "started_at": meta.get("started_at", ""),
+        "status": status,
+        "final_loss": final_loss,
+        "loss_history": parsed.get("loss_history", []),
+        "total_epochs": total_epochs,
+        "total_steps": total_steps,
+        "checkpoints": list_lora_files(project_dir),
+        "samples": list_sample_images(project_dir),
+        "config": meta.get("conf_snapshot", {}),
+    }
+    history = load_training_runs(project_dir)
+    history["runs"].append(run_data)
+    save_training_runs(project_dir, history)
+
+    # Clean up
+    for p in [pid_path, meta_path]:
+        if os.path.isfile(p):
+            os.remove(p)
+    # Keep log file for debugging
+
+
+def monitor_training(task_id, run_id, project_dir, model_type):
+    """Background thread that polls the log file and updates task state."""
+    global _active_training
+    try:
+        while True:
+            time.sleep(2)
+            pid = check_training_alive(project_dir)
+            parsed = parse_training_log(project_dir)
+
+            checkpoints = list_lora_files(project_dir)
+            samples = list_sample_images(project_dir)
+
+            msg = f"Epoch {parsed.get('epoch',0)}/{parsed.get('total_epochs','?')} — Step {parsed.get('step',0)}/{parsed.get('total_steps','?')}"
+            if parsed.get("avg_loss") is not None:
+                msg += f" — Loss: {parsed['avg_loss']:.4f}"
+
+            update_task(task_id,
+                        progress=f"{parsed.get('step',0)}/{parsed.get('total_steps',0)}",
+                        message=msg,
                         training={"run_id": run_id, "model": model_type,
-                                  "epoch": total_epochs, "total_epochs": total_epochs,
-                                  "step": total_steps, "total_steps": total_steps,
-                                  "avg_loss": final_loss,
-                                  "loss_history": loss_history,
-                                  "checkpoints": final_checkpoints,
-                                  "samples": final_samples,
-                                  "elapsed": "", "eta": ""})
-        else:
-            tail_text = '\n'.join(log_tail[-10:])
-            update_task(task_id, status="failed",
-                        error=f"Training exited with code {exit_code}\n{tail_text}")
+                                  "epoch": parsed.get("epoch", 0),
+                                  "total_epochs": parsed.get("total_epochs", 0),
+                                  "step": parsed.get("step", 0),
+                                  "total_steps": parsed.get("total_steps", 0),
+                                  "avg_loss": parsed.get("avg_loss"),
+                                  "loss_history": parsed.get("loss_history", []),
+                                  "checkpoints": checkpoints,
+                                  "samples": samples,
+                                  "elapsed": parsed.get("elapsed", ""),
+                                  "eta": parsed.get("eta", "")})
 
-        # Save to run history
-        run_data = {
-            "run_id": run_id,
-            "model_type": model_type,
-            "started_at": datetime.datetime.now().isoformat(),
-            "status": "complete" if exit_code == 0 else "failed",
-            "final_loss": final_loss,
-            "loss_history": loss_history,
-            "total_epochs": total_epochs,
-            "total_steps": total_steps,
-            "checkpoints": final_checkpoints,
-            "samples": final_samples,
-            "config": {
-                "learning_rate": conf.get("LEARNING_RATE", "1e-4"),
-                "network_dim": conf.get("NETWORK_DIM", "32"),
-                "network_alpha": conf.get("NETWORK_ALPHA", "16"),
-                "num_repeats": conf.get("NUM_REPEATS", "10"),
-            },
-        }
-        history = load_training_runs(project_dir)
-        history["runs"].append(run_data)
-        save_training_runs(project_dir, history)
+            if pid is None:
+                # Process finished
+                finalize_training(project_dir)
+                final_loss = parsed.get("avg_loss")
+                total_epochs = parsed.get("total_epochs", 0)
+                if total_epochs > 0:
+                    update_task(task_id, status="complete",
+                                message=f"Training complete — {total_epochs} epochs, final loss: {final_loss:.4f}" if final_loss else "Training complete")
+                else:
+                    tail = '\n'.join(parsed.get("log_tail", [])[-10:])
+                    update_task(task_id, status="failed",
+                                error=f"Training failed\n{tail}")
+                break
 
     except Exception as e:
         update_task(task_id, status="failed", error=str(e))
-
     finally:
         with _training_lock:
             _active_training = None
@@ -1248,7 +1305,6 @@ def make_handler(state):
                 self._json_response({"error": "Training already running", "task_id": active["task_id"]}, 409)
                 return
 
-            # Count images to validate
             img_count = sum(1 for f in os.listdir(state.base_dir)
                            if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS) if os.path.isdir(state.base_dir) else 0
             if img_count == 0:
@@ -1261,22 +1317,30 @@ def make_handler(state):
             proj = state.projects[state.current]
             project_dir = proj["dir"]
 
+            pid, err = start_training_process(project_dir, state.model, run_id, task_id, dict(state.conf))
+            if err:
+                update_task(task_id, status="failed", error=err)
+                self._json_response({"error": err}, 400)
+                return
+
             with _training_lock:
                 _active_training = {
                     "task_id": task_id,
                     "run_id": run_id,
                     "project_name": state.current,
+                    "project_dir": project_dir,
                     "model": state.model,
-                    "process": None,
+                    "pid": pid,
                 }
 
+            # Start monitor thread (just reads log file, doesn't own the process)
             thread = threading.Thread(
-                target=run_training_task,
-                args=(task_id, run_id, project_dir, state.model, dict(state.conf)),
+                target=monitor_training,
+                args=(task_id, run_id, project_dir, state.model),
                 daemon=True,
             )
             thread.start()
-            print(f"  Training started: {state.current} ({state.model}), task={task_id}")
+            print(f"  Training started: {state.current} ({state.model}), pid={pid}")
             self._json_response({"task_id": task_id, "run_id": run_id})
 
         def _cancel_training(self):
@@ -1285,22 +1349,71 @@ def make_handler(state):
                 if not _active_training:
                     self._json_response({"error": "No training running"}, 400)
                     return
-                proc = _active_training.get("process")
+                pid = _active_training.get("pid")
                 task_id = _active_training["task_id"]
-                if proc:
+                project_dir = _active_training.get("project_dir", "")
+                if pid:
                     try:
-                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        os.killpg(os.getpgid(pid), signal.SIGTERM)
                     except (ProcessLookupError, OSError):
-                        proc.terminate()
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except (ProcessLookupError, OSError):
+                            pass
                 update_task(task_id, status="failed", error="Cancelled by user")
+                # Clean up PID file
+                pid_path = _training_pid_path(project_dir)
+                if os.path.isfile(pid_path):
+                    os.remove(pid_path)
                 _active_training = None
             print("  Training cancelled")
             self._json_response({"cancelled": True})
 
         def _get_active_training(self):
+            global _active_training
             active = get_active_training()
+
+            # If no active training in memory, check for orphaned process
+            # (training that survived a server restart)
+            if not active:
+                for p in state.project_list:
+                    pid = check_training_alive(p["dir"])
+                    if pid:
+                        meta_path = _training_meta_path(p["dir"])
+                        if os.path.isfile(meta_path):
+                            with open(meta_path, 'r') as f:
+                                meta = json.load(f)
+                            task_id = create_task(f"Training {p['name']} ({p['model']}) [reconnected]")
+                            with _training_lock:
+                                _active_training = {
+                                    "task_id": task_id,
+                                    "run_id": meta["run_id"],
+                                    "project_name": p["name"],
+                                    "project_dir": p["dir"],
+                                    "model": meta["model_type"],
+                                    "pid": pid,
+                                }
+                            thread = threading.Thread(
+                                target=monitor_training,
+                                args=(task_id, meta["run_id"], p["dir"], meta["model_type"]),
+                                daemon=True,
+                            )
+                            thread.start()
+                            print(f"  Reconnected to training: {p['name']}, pid={pid}")
+                            active = _active_training
+                            break
+
             if active:
                 task = get_task(active["task_id"])
+                # Include parsed log state for reconnected sessions
+                parsed = parse_training_log(active.get("project_dir", ""))
+                if task and not task.get("training"):
+                    task["training"] = {
+                        "run_id": active.get("run_id", ""),
+                        "model": active.get("model", ""),
+                        **parsed,
+                        "checkpoints": [], "samples": [],
+                    }
                 self._json_response({"active": True, "task_id": active["task_id"],
                                      "project": active.get("project_name", ""),
                                      "model": active.get("model", ""), "task": task})
