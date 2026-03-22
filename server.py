@@ -24,12 +24,16 @@ Controls:
 """
 
 import argparse
+import datetime
 import json
 import mimetypes
 import os
+import re
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections import Counter
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -452,6 +456,236 @@ def run_tagger_task(task_id, dataset_dir, model, conf):
 
 
 # ---------------------------------------------------------------------------
+# Training system
+# ---------------------------------------------------------------------------
+
+_active_training = None  # {"task_id", "process", "run_id", "project_name"}
+_training_lock = threading.Lock()
+
+# Regex patterns for parsing kohya training output
+_RE_STEP = re.compile(r'(\d+)/(\d+)\s*\[.*?(?:avr_loss[=:]?\s*)([\d.]+)')
+_RE_EPOCH = re.compile(r'epoch\s+(\d+)/(\d+)')
+_RE_LOSS_SIMPLE = re.compile(r'avr_loss[=:]\s*([\d.]+)')
+
+
+def get_active_training():
+    with _training_lock:
+        if _active_training and _active_training.get("task_id"):
+            task = get_task(_active_training["task_id"])
+            if task and task.get("status") == "running":
+                return dict(_active_training)
+    return None
+
+
+def load_training_runs(project_dir):
+    """Load training_runs.json for a project."""
+    path = os.path.join(project_dir, "training_runs.json")
+    if os.path.isfile(path):
+        with open(path, 'r') as f:
+            return json.load(f)
+    return {"runs": []}
+
+
+def save_training_runs(project_dir, data):
+    """Save training_runs.json for a project."""
+    path = os.path.join(project_dir, "training_runs.json")
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
+def list_lora_files(project_dir):
+    """List .safetensors files in project's outputs/ directory."""
+    outputs_dir = os.path.join(project_dir, "outputs")
+    if not os.path.isdir(outputs_dir):
+        return []
+    files = []
+    for f in sorted(os.listdir(outputs_dir)):
+        if f.endswith('.safetensors'):
+            fpath = os.path.join(outputs_dir, f)
+            stat = os.stat(fpath)
+            files.append({
+                "filename": f,
+                "size_mb": round(stat.st_size / (1024 * 1024), 1),
+                "modified": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            })
+    return files
+
+
+def list_sample_images(project_dir):
+    """List sample images from project's samples/ directory."""
+    samples_dir = os.path.join(project_dir, "samples")
+    if not os.path.isdir(samples_dir):
+        return []
+    exts = {'.png', '.jpg', '.jpeg', '.webp'}
+    return sorted(f for f in os.listdir(samples_dir)
+                  if os.path.splitext(f)[1].lower() in exts)
+
+
+def run_training_task(task_id, run_id, project_dir, model_type, conf):
+    """Background task: launch training and parse output in real time."""
+    global _active_training
+
+    loss_history = []
+    checkpoints = []
+    current_epoch = 0
+    total_epochs = 0
+    total_steps = 0
+    last_loss_step = -1
+
+    try:
+        sd_scripts = conf.get("SD_SCRIPTS", "")
+        if not sd_scripts or not os.path.isdir(sd_scripts):
+            update_task(task_id, status="failed", error="SD_SCRIPTS path not found")
+            return
+
+        train_script = os.path.join(project_dir, "train_character.sh")
+        if not os.path.isfile(train_script):
+            update_task(task_id, status="failed", error="train_character.sh not found")
+            return
+
+        update_task(task_id, message="Launching training...",
+                    training={"run_id": run_id, "model": model_type,
+                              "epoch": 0, "total_epochs": 0,
+                              "step": 0, "total_steps": 0,
+                              "avg_loss": None, "loss_history": [],
+                              "checkpoints": [], "samples": [],
+                              "elapsed": "", "eta": ""})
+
+        # Launch training subprocess
+        env = os.environ.copy()
+        proc = subprocess.Popen(
+            ["bash", train_script, model_type],
+            cwd=project_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            bufsize=0,
+        )
+
+        with _training_lock:
+            if _active_training:
+                _active_training["process"] = proc
+
+        # Read output character by character to handle tqdm \r overwrites
+        line_buf = ""
+        while True:
+            chunk = proc.stdout.read(1)
+            if not chunk:
+                break
+            ch = chunk.decode('utf-8', errors='replace')
+
+            if ch == '\r' or ch == '\n':
+                line = line_buf.strip()
+                line_buf = ""
+                if not line:
+                    continue
+
+                # Parse epoch marker
+                m = _RE_EPOCH.search(line)
+                if m:
+                    current_epoch = int(m.group(1))
+                    total_epochs = int(m.group(2))
+
+                # Parse step progress + loss
+                m = _RE_STEP.search(line)
+                if m:
+                    step = int(m.group(1))
+                    total_steps = int(m.group(2))
+                    avg_loss = float(m.group(3))
+
+                    # Sample loss history every ~10 steps
+                    if step - last_loss_step >= 10:
+                        loss_history.append({"step": step, "loss": avg_loss})
+                        last_loss_step = step
+
+                    # Parse elapsed/eta from tqdm bracket
+                    elapsed = ""
+                    eta = ""
+                    bracket = re.search(r'\[(\d+:\d+)<(\d+:\d+)', line)
+                    if bracket:
+                        elapsed = bracket.group(1)
+                        eta = bracket.group(2)
+
+                    update_task(task_id,
+                                progress=f"{step}/{total_steps}",
+                                message=f"Epoch {current_epoch}/{total_epochs} — Step {step}/{total_steps} — Loss: {avg_loss:.4f}",
+                                training={"run_id": run_id, "model": model_type,
+                                          "epoch": current_epoch, "total_epochs": total_epochs,
+                                          "step": step, "total_steps": total_steps,
+                                          "avg_loss": avg_loss,
+                                          "loss_history": loss_history[-200:],
+                                          "checkpoints": checkpoints,
+                                          "samples": list_sample_images(project_dir),
+                                          "elapsed": elapsed, "eta": eta})
+                else:
+                    # Check for loss in simpler format
+                    m2 = _RE_LOSS_SIMPLE.search(line)
+                    if m2:
+                        avg_loss = float(m2.group(1))
+
+                # Detect checkpoint saves
+                if 'model saved' in line.lower() or 'saving model' in line.lower():
+                    new_files = list_lora_files(project_dir)
+                    checkpoints = new_files
+
+            else:
+                line_buf += ch
+
+        proc.wait()
+        exit_code = proc.returncode
+
+        # Gather final outputs
+        final_checkpoints = list_lora_files(project_dir)
+        final_samples = list_sample_images(project_dir)
+        final_loss = loss_history[-1]["loss"] if loss_history else None
+
+        if exit_code == 0:
+            update_task(task_id, status="complete",
+                        message=f"Training complete — {total_epochs} epochs, final loss: {final_loss:.4f}" if final_loss else "Training complete",
+                        training={"run_id": run_id, "model": model_type,
+                                  "epoch": total_epochs, "total_epochs": total_epochs,
+                                  "step": total_steps, "total_steps": total_steps,
+                                  "avg_loss": final_loss,
+                                  "loss_history": loss_history,
+                                  "checkpoints": final_checkpoints,
+                                  "samples": final_samples,
+                                  "elapsed": "", "eta": ""})
+        else:
+            update_task(task_id, status="failed",
+                        error=f"Training exited with code {exit_code}")
+
+        # Save to run history
+        run_data = {
+            "run_id": run_id,
+            "model_type": model_type,
+            "started_at": datetime.datetime.now().isoformat(),
+            "status": "complete" if exit_code == 0 else "failed",
+            "final_loss": final_loss,
+            "loss_history": loss_history,
+            "total_epochs": total_epochs,
+            "total_steps": total_steps,
+            "checkpoints": final_checkpoints,
+            "samples": final_samples,
+            "config": {
+                "learning_rate": conf.get("LEARNING_RATE", "1e-4"),
+                "network_dim": conf.get("NETWORK_DIM", "32"),
+                "network_alpha": conf.get("NETWORK_ALPHA", "16"),
+                "num_repeats": conf.get("NUM_REPEATS", "10"),
+            },
+        }
+        history = load_training_runs(project_dir)
+        history["runs"].append(run_data)
+        save_training_runs(project_dir, history)
+
+    except Exception as e:
+        update_task(task_id, status="failed", error=str(e))
+
+    finally:
+        with _training_lock:
+            _active_training = None
+
+
+# ---------------------------------------------------------------------------
 # Image listing and stats
 # ---------------------------------------------------------------------------
 
@@ -575,6 +809,18 @@ def make_handler(state):
                 self._get_config()
             elif path == '/api/projects':
                 self._get_projects()
+            elif path == '/api/training/active':
+                self._get_active_training()
+            elif path == '/api/training/runs':
+                self._get_training_runs()
+            elif path == '/api/training/loras':
+                self._get_lora_files()
+            elif path.startswith('/api/training/loras/download/'):
+                self._download_lora(path.split('/')[-1])
+            elif path == '/api/training/samples':
+                self._get_training_samples()
+            elif path.startswith('/api/training/sample/'):
+                self._serve_sample_image(path[len('/api/training/sample/'):])
             elif path.startswith('/img/'):
                 self._serve_image(path[5:])
             elif path == '/favicon.ico':
@@ -599,6 +845,10 @@ def make_handler(state):
                 self._handle_setup()
             elif path == '/api/switch-project':
                 self._switch_project(self._read_body())
+            elif path == '/api/train':
+                self._start_training()
+            elif path == '/api/train/cancel':
+                self._cancel_training()
             else:
                 self.send_error(404)
 
@@ -810,6 +1060,136 @@ def make_handler(state):
             else:
                 self._json_response({'error': f'Unknown project: {name}'}, 400)
 
+        # --- Training endpoints ---
+
+        def _start_training(self):
+            global _active_training
+            active = get_active_training()
+            if active:
+                self._json_response({"error": "Training already running", "task_id": active["task_id"]}, 409)
+                return
+
+            # Count images to validate
+            img_count = sum(1 for f in os.listdir(state.base_dir)
+                           if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS) if os.path.isdir(state.base_dir) else 0
+            if img_count == 0:
+                self._json_response({"error": "No images in dataset"}, 400)
+                return
+
+            task_id = create_task(f"Training {state.current} ({state.model})")
+            run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{state.model}"
+
+            proj = state.projects[state.current]
+            project_dir = proj["dir"]
+
+            with _training_lock:
+                _active_training = {
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "project_name": state.current,
+                    "model": state.model,
+                    "process": None,
+                }
+
+            thread = threading.Thread(
+                target=run_training_task,
+                args=(task_id, run_id, project_dir, state.model, dict(state.conf)),
+                daemon=True,
+            )
+            thread.start()
+            print(f"  Training started: {state.current} ({state.model}), task={task_id}")
+            self._json_response({"task_id": task_id, "run_id": run_id})
+
+        def _cancel_training(self):
+            global _active_training
+            with _training_lock:
+                if not _active_training:
+                    self._json_response({"error": "No training running"}, 400)
+                    return
+                proc = _active_training.get("process")
+                task_id = _active_training["task_id"]
+                if proc:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    except (ProcessLookupError, OSError):
+                        proc.terminate()
+                update_task(task_id, status="failed", error="Cancelled by user")
+                _active_training = None
+            print("  Training cancelled")
+            self._json_response({"cancelled": True})
+
+        def _get_active_training(self):
+            active = get_active_training()
+            if active:
+                task = get_task(active["task_id"])
+                self._json_response({"active": True, "task_id": active["task_id"],
+                                     "project": active.get("project_name", ""),
+                                     "model": active.get("model", ""), "task": task})
+            else:
+                self._json_response({"active": False})
+
+        def _get_training_runs(self):
+            proj = state.projects[state.current]
+            runs = load_training_runs(proj["dir"])
+            self._json_response(runs)
+
+        def _get_lora_files(self):
+            proj = state.projects[state.current]
+            files = list_lora_files(proj["dir"])
+            self._json_response({"files": files})
+
+        def _download_lora(self, filename):
+            proj = state.projects[state.current]
+            outputs_dir = os.path.join(proj["dir"], "outputs")
+            filepath = os.path.abspath(os.path.join(outputs_dir, filename))
+            if not filepath.startswith(os.path.abspath(outputs_dir)):
+                self.send_error(403)
+                return
+            if not os.path.isfile(filepath):
+                self.send_error(404)
+                return
+            file_size = os.path.getsize(filepath)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/octet-stream')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
+            self.send_header('Content-Length', str(file_size))
+            self.end_headers()
+            with open(filepath, 'rb') as f:
+                while True:
+                    chunk = f.read(1024 * 1024)  # 1MB chunks
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except BrokenPipeError:
+                        break
+
+        def _get_training_samples(self):
+            proj = state.projects[state.current]
+            samples = list_sample_images(proj["dir"])
+            self._json_response({"samples": samples})
+
+        def _serve_sample_image(self, rel_path):
+            proj = state.projects[state.current]
+            samples_dir = os.path.join(proj["dir"], "samples")
+            filepath = os.path.abspath(os.path.join(samples_dir, rel_path))
+            if not filepath.startswith(os.path.abspath(samples_dir)):
+                self.send_error(403)
+                return
+            if not os.path.isfile(filepath):
+                self.send_error(404)
+                return
+            mime = mimetypes.guess_type(filepath)[0] or 'image/png'
+            self.send_response(200)
+            self.send_header('Content-Type', mime)
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            try:
+                with open(filepath, 'rb') as f:
+                    self.wfile.write(f.read())
+            except BrokenPipeError:
+                pass
+
     return Handler
 
 
@@ -955,6 +1335,42 @@ SPA_HTML = '''<!DOCTYPE html>
   .config-status { font-size: 0.82em; color: #888; margin-left: 10px; }
   .config-actions .btn-save.dirty { background: #f39c12; }
 
+  /* Training view */
+  .training-view { padding: 30px 40px; max-width: 900px; }
+  .training-view h2 { margin-bottom: 15px; font-size: 1.2em; color: #f39c12; }
+  .training-view h3 { margin: 25px 0 10px; font-size: 1em; color: #f39c12; border-bottom: 1px solid #333; padding-bottom: 5px; }
+  .train-summary { color: #aaa; font-size: 0.9em; margin-bottom: 15px; line-height: 1.6; }
+  .train-actions { margin: 10px 0; }
+  .train-monitor { margin-bottom: 20px; }
+  .train-info { color: #aaa; font-size: 0.9em; margin-bottom: 10px; }
+  .train-progress { display: flex; align-items: center; gap: 12px; margin: 10px 0; }
+  .train-progress-bar { flex: 1; height: 12px; background: #333; border-radius: 6px; overflow: hidden; }
+  .train-progress-fill { height: 100%; background: #9b59b6; border-radius: 6px; transition: width 0.5s; }
+  .train-progress-text { font-size: 0.85em; color: #aaa; white-space: nowrap; }
+  .train-loss { font-size: 1.4em; color: #2ecc71; font-weight: bold; margin: 8px 0; }
+  .train-section { margin-bottom: 20px; }
+  .lora-files { display: flex; flex-direction: column; gap: 6px; }
+  .lora-file { display: flex; align-items: center; gap: 12px; padding: 8px 12px; background: #16213e; border-radius: 6px; }
+  .lora-file .name { flex: 1; font-family: monospace; font-size: 0.85em; }
+  .lora-file .size { color: #888; font-size: 0.8em; }
+  .lora-file .date { color: #666; font-size: 0.75em; }
+  .lora-file a { color: #3498db; text-decoration: none; font-size: 0.85em; font-weight: 600; }
+  .lora-file a:hover { color: #2980b9; }
+  .run-row { padding: 10px 12px; background: #16213e; border-radius: 6px; margin-bottom: 6px; cursor: pointer; }
+  .run-row:hover { background: #1a2744; }
+  .run-header { display: flex; gap: 15px; align-items: center; font-size: 0.85em; }
+  .run-header .run-date { color: #aaa; }
+  .run-header .run-model { color: #f39c12; font-weight: 600; }
+  .run-header .run-loss { color: #2ecc71; }
+  .run-header .run-status { font-weight: 600; }
+  .run-header .run-status.complete { color: #2ecc71; }
+  .run-header .run-status.failed { color: #e74c3c; }
+  .run-detail { padding: 10px 0; display: none; }
+  .run-detail.open { display: block; }
+  .train-samples { display: flex; flex-wrap: wrap; gap: 8px; }
+  .train-samples img { height: 120px; border-radius: 4px; cursor: pointer; }
+  .train-samples img:hover { opacity: 0.8; }
+
   /* Task progress bar */
   .task-bar { position: fixed; bottom: 0; left: 0; right: 0; background: #16213e; border-top: 1px solid #333;
               padding: 10px 20px; display: none; z-index: 300; align-items: center; gap: 15px; }
@@ -994,6 +1410,7 @@ SPA_HTML = '''<!DOCTYPE html>
   <div class="tab" data-tab="all" onclick="switchTab('all')">All <span class="badge" id="badge-all">0</span></div>
   <div class="tab" data-tab="stats" onclick="switchTab('stats')">Stats</div>
   <div class="tab" data-tab="config" onclick="switchTab('config')">Config</div>
+  <div class="tab" data-tab="training" onclick="switchTab('training')">Training</div>
 </div>
 
 <div class="toolbar" id="toolbar">
@@ -1021,6 +1438,41 @@ SPA_HTML = '''<!DOCTYPE html>
     <button class="btn-refresh" onclick="loadConfig()">Reload</button>
     <button class="btn-tag" onclick="runSetup()">Run Setup</button>
     <span class="config-status" id="configStatus"></span>
+  </div>
+</div>
+
+<div class="training-view" id="trainingView" style="display:none;">
+  <div class="train-launch" id="trainLaunch">
+    <h2>Training</h2>
+    <div class="train-summary" id="trainSummary"></div>
+    <div class="train-actions">
+      <button class="btn-tag" id="trainStartBtn" onclick="startTraining()" style="font-size:1em;padding:12px 30px;">Start Training</button>
+    </div>
+  </div>
+  <div class="train-monitor" id="trainMonitor" style="display:none;">
+    <h2>Training in Progress</h2>
+    <div class="train-info" id="trainInfo"></div>
+    <div class="train-progress">
+      <div class="train-progress-bar"><div class="train-progress-fill" id="trainFill" style="width:0%"></div></div>
+      <span class="train-progress-text" id="trainProgressText"></span>
+    </div>
+    <div class="train-loss" id="trainLoss"></div>
+    <svg id="lossChart" viewBox="0 0 600 200" style="width:100%;max-width:600px;height:200px;background:#0f3460;border-radius:8px;margin:10px 0;"></svg>
+    <div class="train-actions">
+      <button class="btn-delete" onclick="cancelTraining()" style="padding:8px 20px;">Cancel Training</button>
+    </div>
+  </div>
+  <div class="train-section">
+    <h3>LoRA Files</h3>
+    <div id="loraFiles" class="lora-files"></div>
+  </div>
+  <div class="train-section">
+    <h3>Run History</h3>
+    <div id="runHistory"></div>
+  </div>
+  <div class="train-section">
+    <h3>Training Samples</h3>
+    <div id="trainSamples" class="train-samples"></div>
   </div>
 </div>
 
@@ -1139,14 +1591,16 @@ function switchTab(tab) {
   activeTab = tab;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
 
-  const isImageTab = !['stats', 'config'].includes(tab);
+  const isImageTab = !['stats', 'config', 'training'].includes(tab);
   document.getElementById('gallery').style.display = isImageTab ? '' : 'none';
   document.getElementById('toolbar').style.display = isImageTab ? '' : 'none';
   document.getElementById('statsView').style.display = tab === 'stats' ? '' : 'none';
   document.getElementById('configView').style.display = tab === 'config' ? '' : 'none';
+  document.getElementById('trainingView').style.display = tab === 'training' ? '' : 'none';
 
   if (tab === 'stats') renderStats();
   else if (tab === 'config') loadConfig();
+  else if (tab === 'training') loadTraining();
   else renderGrid();
 }
 
@@ -1723,9 +2177,256 @@ function showToast(msg, isError) {
   setTimeout(() => toast.className = 'toast', 3000);
 }
 
+// --- Training tab ---
+let trainingTaskId = null;
+let trainingPollTimer = null;
+
+async function loadTraining() {
+  // Check for active training
+  try {
+    const resp = await fetch('/api/training/active');
+    const data = await resp.json();
+    if (data.active) {
+      trainingTaskId = data.task_id;
+      document.getElementById('trainLaunch').style.display = 'none';
+      document.getElementById('trainMonitor').style.display = '';
+      pollTraining();
+    } else {
+      trainingTaskId = null;
+      document.getElementById('trainLaunch').style.display = '';
+      document.getElementById('trainMonitor').style.display = 'none';
+      renderTrainSummary();
+    }
+  } catch (e) {
+    renderTrainSummary();
+  }
+  loadLoraFiles();
+  loadRunHistory();
+  loadTrainingSamples();
+}
+
+function renderTrainSummary() {
+  const total = allImages.length;
+  const el = document.getElementById('trainSummary');
+  el.innerHTML = `<strong>${total}</strong> images in dataset<br>` +
+    `Model: <strong>${document.getElementById('projectSwitcher').value}</strong>`;
+  if (total === 0) {
+    document.getElementById('trainStartBtn').disabled = true;
+    el.innerHTML += '<br><span style="color:#e74c3c">Add images before training</span>';
+  } else {
+    document.getElementById('trainStartBtn').disabled = false;
+  }
+}
+
+async function startTraining() {
+  if (!confirm('Start training? This will use the GPU for ~1-3 hours.')) return;
+  try {
+    const resp = await fetch('/api/train', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    const data = await resp.json();
+    if (data.error) {
+      showToast(data.error, true);
+      return;
+    }
+    trainingTaskId = data.task_id;
+    document.getElementById('trainLaunch').style.display = 'none';
+    document.getElementById('trainMonitor').style.display = '';
+    showToast('Training started');
+    pollTraining();
+  } catch (e) { showToast('Failed to start: ' + e.message, true); }
+}
+
+async function cancelTraining() {
+  if (!confirm('Cancel training? Progress will be lost.')) return;
+  try {
+    await fetch('/api/train/cancel', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' });
+    showToast('Training cancelled');
+    trainingTaskId = null;
+    if (trainingPollTimer) clearTimeout(trainingPollTimer);
+    document.getElementById('trainLaunch').style.display = '';
+    document.getElementById('trainMonitor').style.display = 'none';
+  } catch (e) { showToast('Cancel failed', true); }
+}
+
+function pollTraining() {
+  if (!trainingTaskId) return;
+  const poll = async () => {
+    try {
+      const resp = await fetch('/api/tasks/' + trainingTaskId);
+      const task = await resp.json();
+      const t = task.training || {};
+
+      // Update progress bar
+      const pct = t.total_steps > 0 ? Math.round((t.step / t.total_steps) * 100) : 0;
+      document.getElementById('trainFill').style.width = pct + '%';
+      document.getElementById('trainProgressText').textContent =
+        `Epoch ${t.epoch || 0}/${t.total_epochs || '?'} \u2014 Step ${t.step || 0}/${t.total_steps || '?'} (${pct}%)`;
+
+      // Update info
+      let info = task.message || '';
+      if (t.eta) info += ` \u2014 ETA: ${t.eta}`;
+      if (t.elapsed) info += ` (elapsed: ${t.elapsed})`;
+      document.getElementById('trainInfo').textContent = info;
+
+      // Update loss
+      if (t.avg_loss != null) {
+        document.getElementById('trainLoss').textContent = 'Loss: ' + t.avg_loss.toFixed(4);
+      }
+
+      // Render loss chart
+      if (t.loss_history && t.loss_history.length > 1) {
+        renderLossChart(t.loss_history);
+      }
+
+      if (task.status === 'running') {
+        trainingPollTimer = setTimeout(poll, 2000);
+      } else {
+        // Training finished
+        trainingTaskId = null;
+        document.getElementById('trainLaunch').style.display = '';
+        document.getElementById('trainMonitor').style.display = 'none';
+        if (task.status === 'complete') {
+          showToast(task.message || 'Training complete');
+          document.getElementById('trainFill').style.background = '#2ecc71';
+        } else {
+          showToast('Training failed: ' + (task.error || 'unknown'), true);
+        }
+        loadLoraFiles();
+        loadRunHistory();
+        loadTrainingSamples();
+      }
+    } catch (e) {
+      trainingPollTimer = setTimeout(poll, 5000);
+    }
+  };
+  poll();
+}
+
+function renderLossChart(history) {
+  const svg = document.getElementById('lossChart');
+  const W = 600, H = 200, PAD = 45, RPAD = 10, TPAD = 10, BPAD = 25;
+  const plotW = W - PAD - RPAD, plotH = H - TPAD - BPAD;
+
+  const losses = history.map(p => p.loss);
+  const maxStep = history[history.length - 1].step;
+  const minLoss = Math.min(...losses) * 0.95;
+  const maxLoss = Math.max(...losses) * 1.05;
+  const lossRange = maxLoss - minLoss || 0.01;
+
+  const pts = history.map(p => {
+    const x = PAD + (p.step / maxStep) * plotW;
+    const y = TPAD + (1 - (p.loss - minLoss) / lossRange) * plotH;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+
+  let html = '';
+  // Grid lines
+  for (let i = 0; i <= 4; i++) {
+    const y = TPAD + (i / 4) * plotH;
+    const val = maxLoss - (i / 4) * lossRange;
+    html += `<line x1="${PAD}" y1="${y}" x2="${W-RPAD}" y2="${y}" stroke="#1a1a2e" stroke-width="1"/>`;
+    html += `<text x="${PAD-5}" y="${y+4}" fill="#888" font-size="10" text-anchor="end">${val.toFixed(3)}</text>`;
+  }
+  // X axis labels
+  for (let i = 0; i <= 4; i++) {
+    const x = PAD + (i / 4) * plotW;
+    const step = Math.round((i / 4) * maxStep);
+    html += `<text x="${x}" y="${H-5}" fill="#888" font-size="10" text-anchor="middle">${step}</text>`;
+  }
+  // Loss line
+  html += `<polyline points="${pts}" fill="none" stroke="#9b59b6" stroke-width="2"/>`;
+  // Latest point
+  if (history.length > 0) {
+    const last = history[history.length - 1];
+    const lx = PAD + (last.step / maxStep) * plotW;
+    const ly = TPAD + (1 - (last.loss - minLoss) / lossRange) * plotH;
+    html += `<circle cx="${lx}" cy="${ly}" r="4" fill="#f39c12"/>`;
+  }
+  svg.innerHTML = html;
+}
+
+async function loadLoraFiles() {
+  try {
+    const resp = await fetch('/api/training/loras');
+    const data = await resp.json();
+    const el = document.getElementById('loraFiles');
+    if (!data.files || data.files.length === 0) {
+      el.innerHTML = '<div style="color:#888;font-size:0.85em;">No LoRA files yet</div>';
+      return;
+    }
+    el.innerHTML = data.files.map(f =>
+      `<div class="lora-file">
+        <span class="name">${f.filename}</span>
+        <span class="size">${f.size_mb} MB</span>
+        <span class="date">${f.modified.split('T')[0]}</span>
+        <a href="/api/training/loras/download/${encodeURIComponent(f.filename)}" download>Download</a>
+      </div>`
+    ).join('');
+  } catch (e) {}
+}
+
+async function loadRunHistory() {
+  try {
+    const resp = await fetch('/api/training/runs');
+    const data = await resp.json();
+    const el = document.getElementById('runHistory');
+    if (!data.runs || data.runs.length === 0) {
+      el.innerHTML = '<div style="color:#888;font-size:0.85em;">No training runs yet</div>';
+      return;
+    }
+    el.innerHTML = data.runs.slice().reverse().map((r, i) => {
+      const date = r.started_at ? r.started_at.split('T')[0] + ' ' + (r.started_at.split('T')[1] || '').slice(0,5) : '?';
+      const loss = r.final_loss != null ? r.final_loss.toFixed(4) : '?';
+      return `<div class="run-row" onclick="this.querySelector('.run-detail').classList.toggle('open')">
+        <div class="run-header">
+          <span class="run-date">${date}</span>
+          <span class="run-model">${r.model_type || '?'}</span>
+          <span>Epochs: ${r.total_epochs || '?'}</span>
+          <span class="run-loss">Loss: ${loss}</span>
+          <span class="run-status ${r.status || ''}">${r.status || '?'}</span>
+        </div>
+        <div class="run-detail">
+          <div style="color:#888;font-size:0.82em;padding:5px 0;">
+            Steps: ${r.total_steps || '?'} |
+            Checkpoints: ${(r.checkpoints || []).length} |
+            Run ID: ${r.run_id || '?'}
+          </div>
+          ${(r.checkpoints || []).map(c =>
+            `<div class="lora-file" style="margin:3px 0;">
+              <span class="name">${c.filename}</span>
+              <span class="size">${c.size_mb} MB</span>
+              <a href="/api/training/loras/download/${encodeURIComponent(c.filename)}" download>Download</a>
+            </div>`
+          ).join('')}
+        </div>
+      </div>`;
+    }).join('');
+  } catch (e) {}
+}
+
+async function loadTrainingSamples() {
+  try {
+    const resp = await fetch('/api/training/samples');
+    const data = await resp.json();
+    const el = document.getElementById('trainSamples');
+    if (!data.samples || data.samples.length === 0) {
+      el.innerHTML = '<div style="color:#888;font-size:0.85em;">No samples yet</div>';
+      return;
+    }
+    el.innerHTML = data.samples.map(s =>
+      `<img src="/api/training/sample/${encodeURIComponent(s)}" title="${s}" loading="lazy">`
+    ).join('');
+  } catch (e) {}
+}
+
 // --- Init ---
 initProjectSwitcher();
 loadImages();
+// Check for active training on page load
+fetch('/api/training/active').then(r => r.json()).then(data => {
+  if (data.active) {
+    trainingTaskId = data.task_id;
+  }
+}).catch(() => {});
 </script>
 </body>
 </html>'''
