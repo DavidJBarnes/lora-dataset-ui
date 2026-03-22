@@ -2805,7 +2805,7 @@ function renderDashLoras(loras) {
       <span style="color:#f39c12;font-weight:600;min-width:140px;font-size:0.8em;">${f.project}</span>
       <span class="name">${f.filename}</span>
       <span class="size">${f.size_mb} MB</span>
-      <span class="date">${f.modified.split('T')[0]}</span>
+      <span class="date">${f.modified.split('T')[0]} ${(f.modified.split('T')[1]||'').slice(0,5)}</span>
       ${f.has_json ? '<span style="color:#2ecc71;font-size:0.75em;">JSON</span>' : ''}
       ${f.has_preview ? '<span style="color:#2ecc71;font-size:0.75em;">Preview</span>' : ''}
     </div>`
@@ -2988,15 +2988,18 @@ async function loadLoraFiles() {
       el.innerHTML = '<div style="color:#888;font-size:0.85em;">No LoRA files yet</div>';
       return;
     }
-    el.innerHTML = data.files.map(f => {
+    const files = data.files.sort((a, b) => b.modified.localeCompare(a.modified));
+    el.innerHTML = files.map((f, i) => {
+      const isLatest = i === 0;
       const esc = f.filename.replace(/'/g, "\\'");
       const previewUrl = f.has_preview ? `/api/training/loras/preview/${encodeURIComponent(f.filename)}` : '';
-      return `<div class="lora-file" style="flex-wrap:wrap;">
+      return `<div class="lora-file" style="flex-wrap:wrap;${isLatest ? 'border-left:3px solid #2ecc71;' : ''}">
         <div style="display:flex;align-items:center;gap:12px;width:100%;">
           ${previewUrl ? `<img src="${previewUrl}" style="height:50px;border-radius:4px;">` : ''}
           <span class="name">${f.filename}</span>
+          ${isLatest ? '<span style="color:#2ecc71;font-size:0.75em;font-weight:600;">LATEST</span>' : ''}
           <span class="size">${f.size_mb} MB</span>
-          <span class="date">${f.modified.split('T')[0]}</span>
+          <span class="date">${f.modified.split('T')[0]} ${(f.modified.split('T')[1]||'').slice(0,5)}</span>
         </div>
         <div style="display:flex;gap:10px;padding:4px 0 0 0;font-size:0.85em;">
           <a href="/api/training/loras/bundle/${encodeURIComponent(f.filename)}" download>Bundle (.zip)</a>
