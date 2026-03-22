@@ -975,17 +975,9 @@ def make_handler(state):
                 self.end_headers()
                 return
 
-            # Check If-Modified-Since
-            ims = self.headers.get('If-Modified-Since', '')
-            if ims:
-                try:
-                    ims_time = time.mktime(time.strptime(ims, '%a, %d %b %Y %H:%M:%S GMT')) - time.timezone
-                    if mtime <= ims_time:
-                        self.send_response(304)
-                        self.end_headers()
-                        return
-                except (ValueError, OverflowError):
-                    pass
+            # Only check If-Modified-Since if ETag also matches (avoids
+            # cross-project cache collisions where mtime happens to match)
+            # Skip — ETag is the authoritative cache validator
 
             mime = mimetypes.guess_type(filepath)[0] or 'application/octet-stream'
             self.send_response(200)
