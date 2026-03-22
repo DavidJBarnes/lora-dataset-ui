@@ -31,17 +31,20 @@ OUTPUT_DIR="${PROJECT_DIR}/outputs"
 LOG_DIR="${PROJECT_DIR}/logs"
 CONFIG_FILE="${PROJECT_DIR}/.config_${MODEL}.toml"
 
+# Timestamp for unique output names
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
 # Model-specific settings
 case "$MODEL" in
   pony)
     MODEL_PATH="$PONY_MODEL_PATH"
-    OUTPUT_NAME="${TRIGGER}_pony_${VERSION}"
+    OUTPUT_NAME="${TRIGGER}_pony_${VERSION}_${TIMESTAMP}"
     KEEP_TOKENS=6
     echo "Training: CyberRealistic Pony"
     ;;
   lustify)
     MODEL_PATH="$LUSTIFY_MODEL_PATH"
-    OUTPUT_NAME="${TRIGGER}_lustify_${VERSION}"
+    OUTPUT_NAME="${TRIGGER}_lustify_${VERSION}_${TIMESTAMP}"
     KEEP_TOKENS=1
     echo "Training: Lustify-SDXL"
     ;;

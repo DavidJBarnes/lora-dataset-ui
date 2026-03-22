@@ -557,13 +557,22 @@ def get_lora_preview_path(project_dir, lora_filename):
 
 
 def list_sample_images(project_dir):
-    """List sample images from project's outputs/sample/ directory."""
+    """List sample images from project's outputs/sample/ directory with epoch info."""
     samples_dir = os.path.join(project_dir, "outputs", "sample")
     if not os.path.isdir(samples_dir):
         return []
     exts = {'.png', '.jpg', '.jpeg', '.webp'}
-    return sorted(f for f in os.listdir(samples_dir)
-                  if os.path.splitext(f)[1].lower() in exts)
+    _re_epoch = re.compile(r'_e(\d+)_')
+    samples = []
+    for f in sorted(os.listdir(samples_dir)):
+        if os.path.splitext(f)[1].lower() not in exts:
+            continue
+        epoch = None
+        m = _re_epoch.search(f)
+        if m:
+            epoch = int(m.group(1))
+        samples.append({"filename": f, "epoch": epoch})
+    return samples
 
 
 def _training_log_path(project_dir):
@@ -2950,8 +2959,6 @@ async function loadLoraFiles() {
           <span class="name">${f.filename}</span>
           <span class="size">${f.size_mb} MB</span>
           <span class="date">${f.modified.split('T')[0]}</span>
-          ${f.has_json ? '<span style="color:#2ecc71;font-size:0.75em;">JSON</span>' : ''}
-          ${f.has_preview ? '<span style="color:#2ecc71;font-size:0.75em;">Preview</span>' : ''}
         </div>
         <div style="display:flex;gap:10px;padding:4px 0 0 0;font-size:0.85em;">
           <a href="/api/training/loras/bundle/${encodeURIComponent(f.filename)}" download>Bundle (.zip)</a>
@@ -3166,17 +3173,30 @@ async function loadTrainingSamples() {
       el.innerHTML = '<div style="color:#888;font-size:0.85em;">No samples yet</div>';
       return;
     }
-    el.innerHTML = '<div style="margin-bottom:8px;">' +
+    let html = '<div style="margin-bottom:8px;">' +
       '<button class="btn-delete" id="deleteSamplesBtn" disabled onclick="deleteSelectedSamples()" style="padding:5px 12px;font-size:0.8em;">Delete Selected (0)</button> ' +
       '<button class="btn-select" onclick="selectAllSamples()" style="padding:5px 12px;font-size:0.8em;">Select All</button> ' +
       '<button class="btn-select" onclick="selectedSamples.clear();loadTrainingSamples();" style="padding:5px 12px;font-size:0.8em;">Select None</button>' +
-      '</div>' +
-      '<div class="train-samples">' +
-      data.samples.map(s =>
-        `<div style="position:relative;display:inline-block;" onclick="toggleSampleSelect('${s.replace(/'/g,"\\'")}', this)">
-          <img src="/api/training/sample/${encodeURIComponent(s)}" title="${s}" loading="lazy" style="border:3px solid transparent;">
-        </div>`
-      ).join('') + '</div>';
+      '</div>';
+    // Group by epoch
+    const byEpoch = {};
+    data.samples.forEach(s => {
+      const key = s.epoch != null ? s.epoch : '?';
+      if (!byEpoch[key]) byEpoch[key] = [];
+      byEpoch[key].push(s.filename);
+    });
+    for (const [epoch, files] of Object.entries(byEpoch)) {
+      html += '<div style="color:#f39c12;font-size:0.8em;font-weight:600;margin:10px 0 5px;">Epoch ' + epoch + '</div>';
+      html += '<div class="train-samples">';
+      files.forEach(fname => {
+        const esc = fname.replace(/'/g, "\\'");
+        html += '<div style="position:relative;display:inline-block;" onclick="toggleSampleSelect(\'' + esc + '\', this)">' +
+          '<img src="/api/training/sample/' + encodeURIComponent(fname) + '" title="' + fname + '" loading="lazy" style="border:3px solid transparent;">' +
+          '</div>';
+      });
+      html += '</div>';
+    }
+    el.innerHTML = html;
   } catch (e) {}
 }
 
