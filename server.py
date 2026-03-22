@@ -331,19 +331,39 @@ def get_task(task_id):
 # WD14 Tagger integration
 # ---------------------------------------------------------------------------
 
+ALL_CATEGORY_TAGS_LOWER = set()
+for _tag_list in CATEGORY_TAGS.values():
+    ALL_CATEGORY_TAGS_LOWER.update(t.lower() for t in _tag_list)
+
+
 def merge_captions(existing_caption, wd14_raw, model, conf):
-    """Merge WD14 tags into an existing caption, preserving user tags."""
+    """Merge WD14 tags into an existing caption, preserving user tags.
+
+    Rules:
+    - Never overwrite existing category — skip WD14 category tags if one exists
+    - Never add duplicates (case-insensitive)
+    - Preserve existing tag order, append new tags at end
+    """
     existing_stripped = strip_prefix(existing_caption.strip(), model, conf)
     existing_tags = [t.strip() for t in existing_stripped.split(",") if t.strip()]
     existing_lower = {t.lower() for t in existing_tags}
+
+    # Check if existing caption already has a category
+    has_category = any(t in ALL_CATEGORY_TAGS_LOWER for t in existing_lower)
 
     wd14_tags = [t.strip() for t in wd14_raw.split(",") if t.strip()]
     wd14_tags = [t for t in wd14_tags if t and t.lower() not in REMOVE_TAGS_LOWER]
 
     for tag in wd14_tags:
-        if tag.lower() not in existing_lower:
-            existing_tags.append(tag)
-            existing_lower.add(tag.lower())
+        tag_lower = tag.lower()
+        # Skip duplicates
+        if tag_lower in existing_lower:
+            continue
+        # Skip category tags if existing caption already has a category
+        if has_category and tag_lower in ALL_CATEGORY_TAGS_LOWER:
+            continue
+        existing_tags.append(tag)
+        existing_lower.add(tag_lower)
 
     tags = dedupe_tags(existing_tags)
     prefix = make_prefix(model, conf)
