@@ -811,6 +811,7 @@ def compute_stats(images):
 def make_handler(state):
 
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
 
         def log_message(self, format, *args):
             if args and '404' in str(args[0]):
@@ -823,11 +824,13 @@ def make_handler(state):
             return json.loads(self.rfile.read(length).decode('utf-8'))
 
         def _json_response(self, data, status=200):
+            body = json.dumps(data).encode()
             self.send_response(status)
             self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode())
+            self.wfile.write(body)
 
         def do_GET(self):
             parsed = urlparse(self.path)
@@ -881,6 +884,7 @@ def make_handler(state):
                 self._serve_image(path[5:])
             elif path == '/favicon.ico':
                 self.send_response(204)
+                self.send_header('Content-Length', '0')
                 self.end_headers()
             else:
                 self.send_error(404)
@@ -925,6 +929,7 @@ def make_handler(state):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
             self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.send_header('Content-Length', '0')
             self.end_headers()
 
         def _serve_html(self):
@@ -938,10 +943,12 @@ def make_handler(state):
                  "active": p["name"] == state.current}
                 for p in state.project_list
             ]))
+            body = html.encode()
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Length', str(len(body)))
             self.end_headers()
-            self.wfile.write(html.encode())
+            self.wfile.write(body)
 
         def _serve_image(self, rel_path):
             filepath = os.path.abspath(os.path.join(state.base_dir, rel_path))
