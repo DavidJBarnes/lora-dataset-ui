@@ -963,7 +963,7 @@ def make_handler(state):
             """Serve a file with ETag/Last-Modified caching."""
             stat = os.stat(filepath)
             mtime = stat.st_mtime
-            etag = f'"{int(mtime)}-{stat.st_size}"'
+            etag = f'"{state.current}-{int(mtime)}-{stat.st_size}"'
             last_modified = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(mtime))
 
             # Check If-None-Match (ETag)
