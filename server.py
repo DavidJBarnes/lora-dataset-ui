@@ -849,6 +849,12 @@ def make_handler(state):
                 self._start_training()
             elif path == '/api/train/cancel':
                 self._cancel_training()
+            elif path == '/api/training/loras/delete':
+                self._delete_lora(self._read_body())
+            elif path == '/api/training/loras/rename':
+                self._rename_lora(self._read_body())
+            elif path == '/api/training/samples/delete':
+                self._delete_samples(self._read_body())
             else:
                 self.send_error(404)
 
@@ -1189,6 +1195,72 @@ def make_handler(state):
                     self.wfile.write(f.read())
             except BrokenPipeError:
                 pass
+
+        def _delete_lora(self, data):
+            filename = data.get('filename', '')
+            if not filename or '/' in filename or '\\' in filename:
+                self._json_response({"error": "Invalid filename"}, 400)
+                return
+            proj = state.projects[state.current]
+            outputs_dir = os.path.join(proj["dir"], "outputs")
+            filepath = os.path.abspath(os.path.join(outputs_dir, filename))
+            if not filepath.startswith(os.path.abspath(outputs_dir)):
+                self.send_error(403)
+                return
+            if not os.path.isfile(filepath):
+                self._json_response({"error": "File not found"}, 404)
+                return
+            os.remove(filepath)
+            print(f"  Deleted LoRA: {filename}")
+            self._json_response({"deleted": True, "filename": filename})
+
+        def _rename_lora(self, data):
+            old_name = data.get('old_name', '')
+            new_name = data.get('new_name', '')
+            if not old_name or not new_name:
+                self._json_response({"error": "Missing filenames"}, 400)
+                return
+            for name in [old_name, new_name]:
+                if '/' in name or '\\' in name:
+                    self._json_response({"error": "Invalid filename"}, 400)
+                    return
+            if not new_name.endswith('.safetensors'):
+                new_name += '.safetensors'
+            proj = state.projects[state.current]
+            outputs_dir = os.path.join(proj["dir"], "outputs")
+            old_path = os.path.abspath(os.path.join(outputs_dir, old_name))
+            new_path = os.path.abspath(os.path.join(outputs_dir, new_name))
+            if not old_path.startswith(os.path.abspath(outputs_dir)) or \
+               not new_path.startswith(os.path.abspath(outputs_dir)):
+                self.send_error(403)
+                return
+            if not os.path.isfile(old_path):
+                self._json_response({"error": "File not found"}, 404)
+                return
+            if os.path.exists(new_path):
+                self._json_response({"error": "Target name already exists"}, 409)
+                return
+            os.rename(old_path, new_path)
+            print(f"  Renamed LoRA: {old_name} -> {new_name}")
+            self._json_response({"renamed": True, "old_name": old_name, "new_name": new_name})
+
+        def _delete_samples(self, data):
+            files = data.get('files', [])
+            proj = state.projects[state.current]
+            samples_dir = os.path.join(proj["dir"], "samples")
+            deleted = []
+            for f in files:
+                if '/' in f or '\\' in f:
+                    continue
+                filepath = os.path.abspath(os.path.join(samples_dir, f))
+                if not filepath.startswith(os.path.abspath(samples_dir)):
+                    continue
+                if os.path.isfile(filepath):
+                    os.remove(filepath)
+                    deleted.append(f)
+            if deleted:
+                print(f"  Deleted {len(deleted)} sample(s)")
+            self._json_response({"deleted": deleted})
 
     return Handler
 
@@ -2361,9 +2433,38 @@ async function loadLoraFiles() {
         <span class="size">${f.size_mb} MB</span>
         <span class="date">${f.modified.split('T')[0]}</span>
         <a href="/api/training/loras/download/${encodeURIComponent(f.filename)}" download>Download</a>
+        <a href="#" onclick="renameLora('${f.filename.replace(/'/g,"\\'")}'); return false;" style="color:#f39c12;">Rename</a>
+        <a href="#" onclick="deleteLora('${f.filename.replace(/'/g,"\\'")}'); return false;" style="color:#e74c3c;">Delete</a>
       </div>`
     ).join('');
   } catch (e) {}
+}
+
+async function deleteLora(filename) {
+  if (!confirm('Delete ' + filename + '? Cannot undo.')) return;
+  try {
+    const resp = await fetch('/api/training/loras/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename})
+    });
+    const data = await resp.json();
+    if (data.deleted) { showToast('Deleted ' + filename); loadLoraFiles(); }
+    else showToast(data.error || 'Delete failed', true);
+  } catch (e) { showToast('Delete failed', true); }
+}
+
+async function renameLora(oldName) {
+  const newName = prompt('New filename:', oldName);
+  if (!newName || newName === oldName) return;
+  try {
+    const resp = await fetch('/api/training/loras/rename', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({old_name: oldName, new_name: newName})
+    });
+    const data = await resp.json();
+    if (data.renamed) { showToast('Renamed to ' + data.new_name); loadLoraFiles(); }
+    else showToast(data.error || 'Rename failed', true);
+  } catch (e) { showToast('Rename failed', true); }
 }
 
 async function loadRunHistory() {
@@ -2405,7 +2506,10 @@ async function loadRunHistory() {
   } catch (e) {}
 }
 
+let selectedSamples = new Set();
+
 async function loadTrainingSamples() {
+  selectedSamples.clear();
   try {
     const resp = await fetch('/api/training/samples');
     const data = await resp.json();
@@ -2414,10 +2518,60 @@ async function loadTrainingSamples() {
       el.innerHTML = '<div style="color:#888;font-size:0.85em;">No samples yet</div>';
       return;
     }
-    el.innerHTML = data.samples.map(s =>
-      `<img src="/api/training/sample/${encodeURIComponent(s)}" title="${s}" loading="lazy">`
-    ).join('');
+    el.innerHTML = '<div style="margin-bottom:8px;">' +
+      '<button class="btn-delete" id="deleteSamplesBtn" disabled onclick="deleteSelectedSamples()" style="padding:5px 12px;font-size:0.8em;">Delete Selected (0)</button> ' +
+      '<button class="btn-select" onclick="selectAllSamples()" style="padding:5px 12px;font-size:0.8em;">Select All</button> ' +
+      '<button class="btn-select" onclick="selectedSamples.clear();loadTrainingSamples();" style="padding:5px 12px;font-size:0.8em;">Select None</button>' +
+      '</div>' +
+      '<div class="train-samples">' +
+      data.samples.map(s =>
+        `<div style="position:relative;display:inline-block;" onclick="toggleSampleSelect('${s.replace(/'/g,"\\'")}', this)">
+          <img src="/api/training/sample/${encodeURIComponent(s)}" title="${s}" loading="lazy" style="border:3px solid transparent;">
+        </div>`
+      ).join('') + '</div>';
   } catch (e) {}
+}
+
+function toggleSampleSelect(filename, el) {
+  if (selectedSamples.has(filename)) {
+    selectedSamples.delete(filename);
+    el.querySelector('img').style.borderColor = 'transparent';
+  } else {
+    selectedSamples.add(filename);
+    el.querySelector('img').style.borderColor = '#e74c3c';
+  }
+  const btn = document.getElementById('deleteSamplesBtn');
+  btn.disabled = selectedSamples.size === 0;
+  btn.textContent = 'Delete Selected (' + selectedSamples.size + ')';
+}
+
+function selectAllSamples() {
+  document.querySelectorAll('#trainSamples .train-samples div').forEach(el => {
+    const img = el.querySelector('img');
+    if (img) {
+      const name = decodeURIComponent(img.src.split('/').pop());
+      selectedSamples.add(name);
+      img.style.borderColor = '#e74c3c';
+    }
+  });
+  const btn = document.getElementById('deleteSamplesBtn');
+  btn.disabled = selectedSamples.size === 0;
+  btn.textContent = 'Delete Selected (' + selectedSamples.size + ')';
+}
+
+async function deleteSelectedSamples() {
+  if (selectedSamples.size === 0) return;
+  if (!confirm('Delete ' + selectedSamples.size + ' sample(s)? Cannot undo.')) return;
+  try {
+    const resp = await fetch('/api/training/samples/delete', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({files: Array.from(selectedSamples)})
+    });
+    const data = await resp.json();
+    showToast('Deleted ' + (data.deleted || []).length + ' samples');
+    selectedSamples.clear();
+    loadTrainingSamples();
+  } catch (e) { showToast('Delete failed', true); }
 }
 
 // --- Init ---
