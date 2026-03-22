@@ -955,10 +955,41 @@ def make_handler(state):
             if not os.path.isfile(filepath):
                 self.send_error(404)
                 return
-            mime = mimetypes.guess_type(filepath)[0] or 'image/png'
+            self._serve_file_cached(filepath)
+
+        def _serve_file_cached(self, filepath):
+            """Serve a file with ETag/Last-Modified caching."""
+            stat = os.stat(filepath)
+            mtime = stat.st_mtime
+            etag = f'"{int(mtime)}-{stat.st_size}"'
+            last_modified = time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime(mtime))
+
+            # Check If-None-Match (ETag)
+            if_none_match = self.headers.get('If-None-Match', '')
+            if if_none_match == etag:
+                self.send_response(304)
+                self.end_headers()
+                return
+
+            # Check If-Modified-Since
+            ims = self.headers.get('If-Modified-Since', '')
+            if ims:
+                try:
+                    ims_time = time.mktime(time.strptime(ims, '%a, %d %b %Y %H:%M:%S GMT')) - time.timezone
+                    if mtime <= ims_time:
+                        self.send_response(304)
+                        self.end_headers()
+                        return
+                except (ValueError, OverflowError):
+                    pass
+
+            mime = mimetypes.guess_type(filepath)[0] or 'application/octet-stream'
             self.send_response(200)
             self.send_header('Content-Type', mime)
-            self.send_header('Cache-Control', 'no-cache')
+            self.send_header('Content-Length', str(stat.st_size))
+            self.send_header('Cache-Control', 'max-age=300, must-revalidate')
+            self.send_header('ETag', etag)
+            self.send_header('Last-Modified', last_modified)
             self.end_headers()
             try:
                 with open(filepath, 'rb') as f:
@@ -1251,16 +1282,7 @@ def make_handler(state):
             if not os.path.isfile(filepath):
                 self.send_error(404)
                 return
-            mime = mimetypes.guess_type(filepath)[0] or 'image/png'
-            self.send_response(200)
-            self.send_header('Content-Type', mime)
-            self.send_header('Cache-Control', 'no-cache')
-            self.end_headers()
-            try:
-                with open(filepath, 'rb') as f:
-                    self.wfile.write(f.read())
-            except BrokenPipeError:
-                pass
+            self._serve_file_cached(filepath)
 
         def _delete_lora(self, data):
             filename = data.get('filename', '')
@@ -1350,13 +1372,7 @@ def make_handler(state):
             if not preview_path:
                 self.send_error(404)
                 return
-            mime = mimetypes.guess_type(preview_path)[0] or 'image/png'
-            self.send_response(200)
-            self.send_header('Content-Type', mime)
-            self.send_header('Cache-Control', 'no-cache')
-            self.end_headers()
-            with open(preview_path, 'rb') as f:
-                self.wfile.write(f.read())
+            self._serve_file_cached(preview_path)
 
         def _set_lora_preview(self, data):
             """Copy a dataset image as the preview for a LoRA file."""
