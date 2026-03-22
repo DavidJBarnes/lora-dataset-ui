@@ -865,6 +865,8 @@ def make_handler(state):
                 self._get_config()
             elif path == '/api/projects':
                 self._get_projects()
+            elif path == '/api/dashboard':
+                self._get_dashboard()
             elif path == '/api/training/active':
                 self._get_active_training()
             elif path == '/api/training/runs':
@@ -1176,6 +1178,54 @@ def make_handler(state):
                     for p in state.project_list
                 ],
                 'current': state.current,
+            })
+
+        def _get_dashboard(self):
+            """Aggregate data across all projects for the dashboard."""
+            active = get_active_training()
+            active_info = None
+            if active:
+                task = get_task(active["task_id"])
+                active_info = {
+                    "task_id": active["task_id"],
+                    "project": active.get("project_name", ""),
+                    "model": active.get("model", ""),
+                    "task": task,
+                }
+
+            all_runs = []
+            all_loras = []
+            project_summaries = []
+            for p in state.project_list:
+                pdir = p["dir"]
+                # Runs
+                history = load_training_runs(pdir)
+                for r in history.get("runs", []):
+                    r["project"] = p["name"]
+                    all_runs.append(r)
+                # LoRA files
+                for lf in list_lora_files(pdir):
+                    lf["project"] = p["name"]
+                    all_loras.append(lf)
+                # Image count
+                dataset_dir = p["dataset_dir"]
+                img_count = sum(1 for f in os.listdir(dataset_dir)
+                                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS) if os.path.isdir(dataset_dir) else 0
+                project_summaries.append({
+                    "name": p["name"], "model": p["model"],
+                    "trigger": p["trigger"], "images": img_count,
+                    "runs": len(history.get("runs", [])),
+                    "loras": sum(1 for lf in list_lora_files(pdir)),
+                })
+
+            # Sort runs by date, newest first
+            all_runs.sort(key=lambda r: r.get("started_at", ""), reverse=True)
+
+            self._json_response({
+                "active_training": active_info,
+                "projects": project_summaries,
+                "runs": all_runs,
+                "loras": all_loras,
             })
 
         def _switch_project(self, data):
@@ -1608,6 +1658,17 @@ SPA_HTML = '''<!DOCTYPE html>
   .config-status { font-size: 0.82em; color: #888; margin-left: 10px; }
   .config-actions .btn-save.dirty { background: #f39c12; }
 
+  /* Dashboard view */
+  .dashboard-view { padding: 30px 40px; max-width: 1000px; }
+  .dashboard-view h2 { margin-bottom: 15px; }
+  .dash-active { background: #1a2744; border: 2px solid #9b59b6; border-radius: 8px; padding: 15px 20px; margin-bottom: 20px; }
+  .dash-active .status { color: #9b59b6; font-weight: 600; font-size: 1.1em; }
+  .dash-projects { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .dash-project { background: #16213e; border-radius: 8px; padding: 15px; cursor: pointer; border: 2px solid transparent; transition: border-color 0.15s; }
+  .dash-project:hover { border-color: #f39c12; }
+  .dash-project .name { color: #f39c12; font-weight: 600; font-size: 0.95em; margin-bottom: 5px; }
+  .dash-project .meta { color: #888; font-size: 0.8em; line-height: 1.5; }
+
   /* Training view */
   .training-view { padding: 30px 40px; max-width: 900px; }
   .training-view h2 { margin-bottom: 15px; font-size: 1.2em; color: #f39c12; }
@@ -1675,6 +1736,7 @@ SPA_HTML = '''<!DOCTYPE html>
 </div>
 
 <div class="tabs" id="tabBar">
+  <div class="tab" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</div>
   <div class="tab active" data-tab="uncategorized" onclick="switchTab('uncategorized')">Uncategorized <span class="badge" id="badge-uncategorized">0</span></div>
   <div class="tab" data-tab="face_closeup" onclick="switchTab('face_closeup')">Face Closeup <span class="badge" id="badge-face_closeup">0</span></div>
   <div class="tab" data-tab="head_shoulders" onclick="switchTab('head_shoulders')">Head/Shoulders <span class="badge" id="badge-head_shoulders">0</span></div>
@@ -1698,6 +1760,23 @@ SPA_HTML = '''<!DOCTYPE html>
 
 <div class="gallery" id="gallery">
   <div class="grid" id="grid"></div>
+</div>
+
+<div class="dashboard-view" id="dashboardView" style="display:none;">
+  <h2 style="color:#f39c12;margin-bottom:20px;">Dashboard</h2>
+  <div id="dashActiveTraining"></div>
+  <div class="train-section">
+    <h3>Projects</h3>
+    <div id="dashProjects"></div>
+  </div>
+  <div class="train-section">
+    <h3>All Training Runs</h3>
+    <div id="dashRuns"></div>
+  </div>
+  <div class="train-section">
+    <h3>All LoRA Files</h3>
+    <div id="dashLoras" class="lora-files"></div>
+  </div>
 </div>
 
 <div class="stats-view" id="statsView" style="display:none;"></div>
@@ -1866,14 +1945,16 @@ function switchTab(tab) {
   activeTab = tab;
   document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
 
-  const isImageTab = !['stats', 'config', 'training'].includes(tab);
+  const isImageTab = !['stats', 'config', 'training', 'dashboard'].includes(tab);
   document.getElementById('gallery').style.display = isImageTab ? '' : 'none';
   document.getElementById('toolbar').style.display = isImageTab ? '' : 'none';
   document.getElementById('statsView').style.display = tab === 'stats' ? '' : 'none';
   document.getElementById('configView').style.display = tab === 'config' ? '' : 'none';
   document.getElementById('trainingView').style.display = tab === 'training' ? '' : 'none';
+  document.getElementById('dashboardView').style.display = tab === 'dashboard' ? '' : 'none';
 
-  if (tab === 'stats') renderStats();
+  if (tab === 'dashboard') loadDashboard();
+  else if (tab === 'stats') renderStats();
   else if (tab === 'config') loadConfig();
   else if (tab === 'training') loadTraining();
   else renderGrid();
@@ -2472,6 +2553,106 @@ function showToast(msg, isError) {
   toast.textContent = msg;
   toast.className = 'toast show' + (isError ? ' error' : '');
   setTimeout(() => toast.className = 'toast', 3000);
+}
+
+// --- Dashboard tab ---
+async function loadDashboard() {
+  try {
+    const resp = await fetch('/api/dashboard');
+    const d = await resp.json();
+    renderDashActive(d.active_training);
+    renderDashProjects(d.projects);
+    renderDashRuns(d.runs);
+    renderDashLoras(d.loras);
+  } catch (e) { showToast('Failed to load dashboard', true); }
+}
+
+function renderDashActive(active) {
+  const el = document.getElementById('dashActiveTraining');
+  if (!active) {
+    el.innerHTML = '';
+    return;
+  }
+  const t = active.task || {};
+  const tr = t.training || {};
+  const pct = tr.total_steps > 0 ? Math.round((tr.step / tr.total_steps) * 100) : 0;
+  el.innerHTML = `<div class="dash-active">
+    <div class="status">Training in progress: ${active.project} (${active.model})</div>
+    <div style="color:#aaa;font-size:0.9em;margin-top:5px;">
+      Epoch ${tr.epoch || 0}/${tr.total_epochs || '?'} \u2014 Step ${tr.step || 0}/${tr.total_steps || '?'} (${pct}%)
+      ${tr.avg_loss != null ? ' \u2014 Loss: ' + tr.avg_loss.toFixed(4) : ''}
+      ${tr.eta ? ' \u2014 ETA: ' + tr.eta : ''}
+    </div>
+    <div style="margin-top:8px;">
+      <div class="train-progress-bar" style="height:8px;"><div class="train-progress-fill" style="width:${pct}%"></div></div>
+    </div>
+  </div>`;
+}
+
+function renderDashProjects(projects) {
+  const el = document.getElementById('dashProjects');
+  if (!projects || projects.length === 0) {
+    el.innerHTML = '<div style="color:#888;">No projects found</div>';
+    return;
+  }
+  el.innerHTML = '<div class="dash-projects">' + projects.map(p =>
+    `<div class="dash-project" onclick="document.getElementById('projectSwitcher').value='${p.name}';switchProject('${p.name}');switchTab('uncategorized');">
+      <div class="name">${p.name}</div>
+      <div class="meta">
+        Model: ${p.model}<br>
+        Trigger: ${p.trigger}<br>
+        Images: ${p.images}<br>
+        Runs: ${p.runs} | LoRAs: ${p.loras}
+      </div>
+    </div>`
+  ).join('') + '</div>';
+}
+
+function renderDashRuns(runs) {
+  const el = document.getElementById('dashRuns');
+  if (!runs || runs.length === 0) {
+    el.innerHTML = '<div style="color:#888;font-size:0.85em;">No training runs yet</div>';
+    return;
+  }
+  el.innerHTML = runs.map(r => {
+    const date = r.started_at ? r.started_at.split('T')[0] + ' ' + (r.started_at.split('T')[1] || '').slice(0,5) : '?';
+    const loss = r.final_loss != null ? r.final_loss.toFixed(4) : '?';
+    return `<div class="run-row" onclick="this.querySelector('.run-detail').classList.toggle('open')">
+      <div class="run-header">
+        <span style="color:#f39c12;font-weight:600;min-width:160px;">${r.project || '?'}</span>
+        <span class="run-date">${date}</span>
+        <span class="run-model">${r.model_type || '?'}</span>
+        <span>Epochs: ${r.total_epochs || '?'}</span>
+        <span class="run-loss">Loss: ${loss}</span>
+        <span class="run-status ${r.status || ''}">${r.status || '?'}</span>
+      </div>
+      <div class="run-detail">
+        <div style="color:#888;font-size:0.82em;padding:5px 0;">
+          Steps: ${r.total_steps || '?'} |
+          Checkpoints: ${(r.checkpoints || []).length} |
+          Run ID: ${r.run_id || '?'}
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function renderDashLoras(loras) {
+  const el = document.getElementById('dashLoras');
+  if (!loras || loras.length === 0) {
+    el.innerHTML = '<div style="color:#888;font-size:0.85em;">No LoRA files yet</div>';
+    return;
+  }
+  el.innerHTML = loras.map(f =>
+    `<div class="lora-file">
+      <span style="color:#f39c12;font-weight:600;min-width:140px;font-size:0.8em;">${f.project}</span>
+      <span class="name">${f.filename}</span>
+      <span class="size">${f.size_mb} MB</span>
+      <span class="date">${f.modified.split('T')[0]}</span>
+      ${f.has_json ? '<span style="color:#2ecc71;font-size:0.75em;">JSON</span>' : ''}
+      ${f.has_preview ? '<span style="color:#2ecc71;font-size:0.75em;">Preview</span>' : ''}
+    </div>`
+  ).join('');
 }
 
 // --- Training tab ---
