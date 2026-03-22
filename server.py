@@ -613,6 +613,7 @@ def run_training_task(task_id, run_id, project_dir, model_type, conf):
 
         # Read output character by character to handle tqdm \r overwrites
         line_buf = ""
+        log_tail = []  # Last 20 lines for error reporting
         while True:
             chunk = proc.stdout.read(1)
             if not chunk:
@@ -624,6 +625,10 @@ def run_training_task(task_id, run_id, project_dir, model_type, conf):
                 line_buf = ""
                 if not line:
                     continue
+
+                log_tail.append(line)
+                if len(log_tail) > 20:
+                    log_tail.pop(0)
 
                 # Parse epoch marker
                 m = _RE_EPOCH.search(line)
@@ -696,8 +701,9 @@ def run_training_task(task_id, run_id, project_dir, model_type, conf):
                                   "samples": final_samples,
                                   "elapsed": "", "eta": ""})
         else:
+            tail_text = '\n'.join(log_tail[-10:])
             update_task(task_id, status="failed",
-                        error=f"Training exited with code {exit_code}")
+                        error=f"Training exited with code {exit_code}\n{tail_text}")
 
         # Save to run history
         run_data = {
