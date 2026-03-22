@@ -2642,34 +2642,61 @@ async function renameLora(oldName) {
   } catch (e) { showToast('Rename failed', true); }
 }
 
+let _metaDialogFilename = '';
+
 async function editLoraMetadata(filename) {
+  _metaDialogFilename = filename;
   try {
     const resp = await fetch('/api/training/loras/metadata/' + encodeURIComponent(filename));
     const meta = await resp.json();
     const fields = ['description', 'sd version', 'activation text', 'preferred weight', 'notes'];
-    // Build a simple form in a prompt-like dialog
-    let html = '<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:500;display:flex;align-items:center;justify-content:center;" id="metaDialog">';
-    html += '<div style="background:#16213e;padding:25px;border-radius:10px;width:500px;max-width:90%;">';
-    html += '<h3 style="color:#f39c12;margin-bottom:15px;">LoRA Metadata: ' + filename + '</h3>';
+    const dlg = document.createElement('div');
+    dlg.id = 'metaDialog';
+    dlg.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:500;display:flex;align-items:center;justify-content:center;';
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#16213e;padding:25px;border-radius:10px;width:500px;max-width:90%;';
+    box.innerHTML = '<h3 style="color:#f39c12;margin-bottom:15px;">LoRA Metadata: ' + filename + '</h3>';
     fields.forEach(f => {
       const val = meta[f] != null ? meta[f] : '';
       const id = 'meta_' + f.replace(/ /g, '_');
-      html += '<label style="color:#aaa;font-size:0.8em;display:block;margin:8px 0 3px;">' + f + '</label>';
+      const lbl = document.createElement('label');
+      lbl.style.cssText = 'color:#aaa;font-size:0.8em;display:block;margin:8px 0 3px;';
+      lbl.textContent = f;
+      box.appendChild(lbl);
       if (f === 'notes') {
-        html += '<textarea id="' + id + '" style="width:100%;height:60px;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;padding:6px;font-size:0.85em;">' + val + '</textarea>';
+        const ta = document.createElement('textarea');
+        ta.id = id;
+        ta.style.cssText = 'width:100%;height:60px;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;padding:6px;font-size:0.85em;';
+        ta.value = val;
+        box.appendChild(ta);
       } else {
-        html += '<input id="' + id + '" value="' + String(val).replace(/"/g,'&quot;') + '" style="width:100%;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;padding:6px;font-size:0.85em;">';
+        const inp = document.createElement('input');
+        inp.id = id;
+        inp.value = String(val);
+        inp.style.cssText = 'width:100%;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;padding:6px;font-size:0.85em;';
+        box.appendChild(inp);
       }
     });
-    html += '<div style="margin-top:15px;display:flex;gap:10px;">';
-    html += '<button class="btn-save" onclick="saveMetadataDialog(\'' + filename.replace(/'/g,"\\'") + '\')">Save</button>';
-    html += '<button class="btn-refresh" onclick="document.getElementById(\'metaDialog\').remove()">Cancel</button>';
-    html += '</div></div></div>';
-    document.body.insertAdjacentHTML('beforeend', html);
+    const btns = document.createElement('div');
+    btns.style.cssText = 'margin-top:15px;display:flex;gap:10px;';
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'btn-save';
+    saveBtn.textContent = 'Save';
+    saveBtn.onclick = () => saveMetadataDialog();
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'btn-refresh';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => dlg.remove();
+    btns.appendChild(saveBtn);
+    btns.appendChild(cancelBtn);
+    box.appendChild(btns);
+    dlg.appendChild(box);
+    document.body.appendChild(dlg);
   } catch (e) { showToast('Failed to load metadata', true); }
 }
 
-async function saveMetadataDialog(filename) {
+async function saveMetadataDialog() {
+  const filename = _metaDialogFilename;
   const metadata = {};
   const fields = ['description', 'sd version', 'activation text', 'preferred weight', 'notes'];
   fields.forEach(f => {
@@ -2693,18 +2720,33 @@ async function saveMetadataDialog(filename) {
 }
 
 function pickLoraPreview(loraFilename) {
-  // Show image picker from current dataset
-  let html = '<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:500;display:flex;flex-direction:column;align-items:center;padding:30px;overflow:auto;" id="previewPicker">';
-  html += '<h3 style="color:#f39c12;margin-bottom:15px;">Select preview image for ' + loraFilename + '</h3>';
-  html += '<button class="btn-refresh" onclick="document.getElementById(\'previewPicker\').remove()" style="position:fixed;top:15px;right:20px;z-index:501;">Close</button>';
-  html += '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;">';
+  const overlay = document.createElement('div');
+  overlay.id = 'previewPicker';
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:500;display:flex;flex-direction:column;align-items:center;padding:30px;overflow:auto;';
+  const title = document.createElement('h3');
+  title.style.cssText = 'color:#f39c12;margin-bottom:15px;';
+  title.textContent = 'Select preview image for ' + loraFilename;
+  overlay.appendChild(title);
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'btn-refresh';
+  closeBtn.textContent = 'Close';
+  closeBtn.style.cssText = 'position:fixed;top:15px;right:20px;z-index:501;';
+  closeBtn.onclick = () => overlay.remove();
+  overlay.appendChild(closeBtn);
+  const grid = document.createElement('div');
+  grid.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;justify-content:center;';
   allImages.forEach(img => {
-    html += '<img src="/img/' + encodeURIComponent(img.filename) + '" style="height:150px;border-radius:6px;cursor:pointer;border:3px solid transparent;" ' +
-      'onclick="setLoraPreview(\'' + loraFilename.replace(/'/g,"\\'") + '\',\'' + img.filename.replace(/'/g,"\\'") + '\')" ' +
-      'onmouseover="this.style.borderColor=\'#f39c12\'" onmouseout="this.style.borderColor=\'transparent\'" loading="lazy">';
+    const el = document.createElement('img');
+    el.src = '/img/' + encodeURIComponent(img.filename);
+    el.style.cssText = 'height:150px;border-radius:6px;cursor:pointer;border:3px solid transparent;';
+    el.loading = 'lazy';
+    el.onmouseover = () => el.style.borderColor = '#f39c12';
+    el.onmouseout = () => el.style.borderColor = 'transparent';
+    el.onclick = () => setLoraPreview(loraFilename, img.filename);
+    grid.appendChild(el);
   });
-  html += '</div></div>';
-  document.body.insertAdjacentHTML('beforeend', html);
+  overlay.appendChild(grid);
+  document.body.appendChild(overlay);
 }
 
 async function setLoraPreview(loraFilename, imageFilename) {
