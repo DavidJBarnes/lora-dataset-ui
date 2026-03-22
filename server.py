@@ -30,11 +30,14 @@ import mimetypes
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import uuid
+import zipfile
+from io import BytesIO
 from collections import Counter
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse, parse_qs
@@ -503,12 +506,60 @@ def list_lora_files(project_dir):
         if f.endswith('.safetensors'):
             fpath = os.path.join(outputs_dir, f)
             stat = os.stat(fpath)
+            base = f.rsplit('.', 1)[0]
+            has_json = os.path.isfile(os.path.join(outputs_dir, base + '.json'))
+            has_preview = (os.path.isfile(os.path.join(outputs_dir, base + '.preview.png')) or
+                           os.path.isfile(os.path.join(outputs_dir, base + '.png')))
             files.append({
                 "filename": f,
                 "size_mb": round(stat.st_size / (1024 * 1024), 1),
                 "modified": datetime.datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                "has_json": has_json,
+                "has_preview": has_preview,
             })
     return files
+
+
+def get_lora_metadata(project_dir, lora_filename, conf):
+    """Get or auto-generate metadata JSON for a LoRA file."""
+    outputs_dir = os.path.join(project_dir, "outputs")
+    base = lora_filename.rsplit('.', 1)[0]
+    json_path = os.path.join(outputs_dir, base + '.json')
+    if os.path.isfile(json_path):
+        with open(json_path, 'r') as f:
+            return json.load(f)
+    # Auto-generate from project config
+    trigger = conf.get("TRIGGER", "")
+    cls = conf.get("CLASS", "woman")
+    model = detect_model(project_dir, conf)
+    sd_version = "SDXL"
+    return {
+        "description": f"{trigger} {cls} LoRA",
+        "sd version": sd_version,
+        "activation text": f"{trigger} {cls}",
+        "preferred weight": 0.75,
+        "notes": "",
+    }
+
+
+def save_lora_metadata(project_dir, lora_filename, metadata):
+    """Save metadata JSON for a LoRA file."""
+    outputs_dir = os.path.join(project_dir, "outputs")
+    base = lora_filename.rsplit('.', 1)[0]
+    json_path = os.path.join(outputs_dir, base + '.json')
+    with open(json_path, 'w') as f:
+        json.dump(metadata, f, indent=2)
+
+
+def get_lora_preview_path(project_dir, lora_filename):
+    """Return preview image path if it exists, else None."""
+    outputs_dir = os.path.join(project_dir, "outputs")
+    base = lora_filename.rsplit('.', 1)[0]
+    for ext in ['.preview.png', '.png']:
+        path = os.path.join(outputs_dir, base + ext)
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def list_sample_images(project_dir):
@@ -821,6 +872,12 @@ def make_handler(state):
                 self._get_training_samples()
             elif path.startswith('/api/training/sample/'):
                 self._serve_sample_image(path[len('/api/training/sample/'):])
+            elif path.startswith('/api/training/loras/metadata/'):
+                self._get_lora_metadata(path.split('/')[-1])
+            elif path.startswith('/api/training/loras/preview/'):
+                self._serve_lora_preview(path.split('/')[-1])
+            elif path.startswith('/api/training/loras/bundle/'):
+                self._download_lora_bundle(path.split('/')[-1])
             elif path.startswith('/img/'):
                 self._serve_image(path[5:])
             elif path == '/favicon.ico':
@@ -855,6 +912,10 @@ def make_handler(state):
                 self._rename_lora(self._read_body())
             elif path == '/api/training/samples/delete':
                 self._delete_samples(self._read_body())
+            elif path == '/api/training/loras/metadata':
+                self._save_lora_metadata(self._read_body())
+            elif path == '/api/training/loras/preview':
+                self._set_lora_preview(self._read_body())
             else:
                 self.send_error(404)
 
@@ -1261,6 +1322,96 @@ def make_handler(state):
             if deleted:
                 print(f"  Deleted {len(deleted)} sample(s)")
             self._json_response({"deleted": deleted})
+
+        def _get_lora_metadata(self, lora_filename):
+            proj = state.projects[state.current]
+            metadata = get_lora_metadata(proj["dir"], lora_filename, state.conf)
+            self._json_response(metadata)
+
+        def _save_lora_metadata(self, data):
+            lora_filename = data.get('filename', '')
+            metadata = data.get('metadata', {})
+            if not lora_filename:
+                self._json_response({"error": "Missing filename"}, 400)
+                return
+            proj = state.projects[state.current]
+            save_lora_metadata(proj["dir"], lora_filename, metadata)
+            print(f"  Saved metadata for {lora_filename}")
+            self._json_response({"saved": True})
+
+        def _serve_lora_preview(self, lora_filename):
+            proj = state.projects[state.current]
+            preview_path = get_lora_preview_path(proj["dir"], lora_filename)
+            if not preview_path:
+                self.send_error(404)
+                return
+            mime = mimetypes.guess_type(preview_path)[0] or 'image/png'
+            self.send_response(200)
+            self.send_header('Content-Type', mime)
+            self.send_header('Cache-Control', 'no-cache')
+            self.end_headers()
+            with open(preview_path, 'rb') as f:
+                self.wfile.write(f.read())
+
+        def _set_lora_preview(self, data):
+            """Copy a dataset image as the preview for a LoRA file."""
+            lora_filename = data.get('filename', '')
+            image_filename = data.get('image', '')
+            if not lora_filename or not image_filename:
+                self._json_response({"error": "Missing filename or image"}, 400)
+                return
+            # Source: dataset image
+            src = os.path.abspath(os.path.join(state.base_dir, image_filename))
+            if not src.startswith(os.path.abspath(state.base_dir)) or not os.path.isfile(src):
+                self._json_response({"error": "Image not found"}, 404)
+                return
+            # Destination: outputs/base.preview.png
+            proj = state.projects[state.current]
+            outputs_dir = os.path.join(proj["dir"], "outputs")
+            base = lora_filename.rsplit('.', 1)[0]
+            dst = os.path.join(outputs_dir, base + '.preview.png')
+            shutil.copy2(src, dst)
+            print(f"  Set preview for {lora_filename}: {image_filename}")
+            self._json_response({"saved": True, "preview": base + '.preview.png'})
+
+        def _download_lora_bundle(self, lora_filename):
+            """Download zip bundle: .safetensors + .json + .preview.png."""
+            proj = state.projects[state.current]
+            outputs_dir = os.path.join(proj["dir"], "outputs")
+            safetensors_path = os.path.abspath(os.path.join(outputs_dir, lora_filename))
+            if not safetensors_path.startswith(os.path.abspath(outputs_dir)):
+                self.send_error(403)
+                return
+            if not os.path.isfile(safetensors_path):
+                self.send_error(404)
+                return
+
+            base = lora_filename.rsplit('.', 1)[0]
+
+            # Auto-generate JSON if missing
+            json_path = os.path.join(outputs_dir, base + '.json')
+            if not os.path.isfile(json_path):
+                metadata = get_lora_metadata(proj["dir"], lora_filename, state.conf)
+                save_lora_metadata(proj["dir"], lora_filename, metadata)
+
+            # Build zip in memory
+            buf = BytesIO()
+            with zipfile.ZipFile(buf, 'w', zipfile.ZIP_STORED) as zf:
+                zf.write(safetensors_path, lora_filename)
+                if os.path.isfile(json_path):
+                    zf.write(json_path, base + '.json')
+                preview_path = get_lora_preview_path(proj["dir"], lora_filename)
+                if preview_path:
+                    zf.write(preview_path, base + '.preview.png')
+
+            zip_data = buf.getvalue()
+            zip_name = base + '.zip'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Disposition', f'attachment; filename="{zip_name}"')
+            self.send_header('Content-Length', str(len(zip_data)))
+            self.end_headers()
+            self.wfile.write(zip_data)
 
     return Handler
 
@@ -2427,16 +2578,28 @@ async function loadLoraFiles() {
       el.innerHTML = '<div style="color:#888;font-size:0.85em;">No LoRA files yet</div>';
       return;
     }
-    el.innerHTML = data.files.map(f =>
-      `<div class="lora-file">
-        <span class="name">${f.filename}</span>
-        <span class="size">${f.size_mb} MB</span>
-        <span class="date">${f.modified.split('T')[0]}</span>
-        <a href="/api/training/loras/download/${encodeURIComponent(f.filename)}" download>Download</a>
-        <a href="#" onclick="renameLora('${f.filename.replace(/'/g,"\\'")}'); return false;" style="color:#f39c12;">Rename</a>
-        <a href="#" onclick="deleteLora('${f.filename.replace(/'/g,"\\'")}'); return false;" style="color:#e74c3c;">Delete</a>
-      </div>`
-    ).join('');
+    el.innerHTML = data.files.map(f => {
+      const esc = f.filename.replace(/'/g, "\\'");
+      const previewUrl = f.has_preview ? `/api/training/loras/preview/${encodeURIComponent(f.filename)}` : '';
+      return `<div class="lora-file" style="flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:12px;width:100%;">
+          ${previewUrl ? `<img src="${previewUrl}" style="height:50px;border-radius:4px;">` : ''}
+          <span class="name">${f.filename}</span>
+          <span class="size">${f.size_mb} MB</span>
+          <span class="date">${f.modified.split('T')[0]}</span>
+          ${f.has_json ? '<span style="color:#2ecc71;font-size:0.75em;">JSON</span>' : ''}
+          ${f.has_preview ? '<span style="color:#2ecc71;font-size:0.75em;">Preview</span>' : ''}
+        </div>
+        <div style="display:flex;gap:10px;padding:4px 0 0 0;font-size:0.85em;">
+          <a href="/api/training/loras/bundle/${encodeURIComponent(f.filename)}" download>Bundle (.zip)</a>
+          <a href="/api/training/loras/download/${encodeURIComponent(f.filename)}" download>.safetensors</a>
+          <a href="#" onclick="editLoraMetadata('${esc}'); return false;" style="color:#9b59b6;">Metadata</a>
+          <a href="#" onclick="pickLoraPreview('${esc}'); return false;" style="color:#f39c12;">Set Preview</a>
+          <a href="#" onclick="renameLora('${esc}'); return false;" style="color:#f39c12;">Rename</a>
+          <a href="#" onclick="deleteLora('${esc}'); return false;" style="color:#e74c3c;">Delete</a>
+        </div>
+      </div>`;
+    }).join('');
   } catch (e) {}
 }
 
@@ -2465,6 +2628,86 @@ async function renameLora(oldName) {
     if (data.renamed) { showToast('Renamed to ' + data.new_name); loadLoraFiles(); }
     else showToast(data.error || 'Rename failed', true);
   } catch (e) { showToast('Rename failed', true); }
+}
+
+async function editLoraMetadata(filename) {
+  try {
+    const resp = await fetch('/api/training/loras/metadata/' + encodeURIComponent(filename));
+    const meta = await resp.json();
+    const fields = ['description', 'sd version', 'activation text', 'preferred weight', 'notes'];
+    // Build a simple form in a prompt-like dialog
+    let html = '<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:500;display:flex;align-items:center;justify-content:center;" id="metaDialog">';
+    html += '<div style="background:#16213e;padding:25px;border-radius:10px;width:500px;max-width:90%;">';
+    html += '<h3 style="color:#f39c12;margin-bottom:15px;">LoRA Metadata: ' + filename + '</h3>';
+    fields.forEach(f => {
+      const val = meta[f] != null ? meta[f] : '';
+      const id = 'meta_' + f.replace(/ /g, '_');
+      html += '<label style="color:#aaa;font-size:0.8em;display:block;margin:8px 0 3px;">' + f + '</label>';
+      if (f === 'notes') {
+        html += '<textarea id="' + id + '" style="width:100%;height:60px;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;padding:6px;font-size:0.85em;">' + val + '</textarea>';
+      } else {
+        html += '<input id="' + id + '" value="' + String(val).replace(/"/g,'&quot;') + '" style="width:100%;background:#0f3460;color:#eee;border:1px solid #333;border-radius:4px;padding:6px;font-size:0.85em;">';
+      }
+    });
+    html += '<div style="margin-top:15px;display:flex;gap:10px;">';
+    html += '<button class="btn-save" onclick="saveMetadataDialog(\'' + filename.replace(/'/g,"\\'") + '\')">Save</button>';
+    html += '<button class="btn-refresh" onclick="document.getElementById(\'metaDialog\').remove()">Cancel</button>';
+    html += '</div></div></div>';
+    document.body.insertAdjacentHTML('beforeend', html);
+  } catch (e) { showToast('Failed to load metadata', true); }
+}
+
+async function saveMetadataDialog(filename) {
+  const metadata = {};
+  const fields = ['description', 'sd version', 'activation text', 'preferred weight', 'notes'];
+  fields.forEach(f => {
+    const id = 'meta_' + f.replace(/ /g, '_');
+    let val = document.getElementById(id).value;
+    if (f === 'preferred weight') val = parseFloat(val) || 0.75;
+    metadata[f] = val;
+  });
+  try {
+    const resp = await fetch('/api/training/loras/metadata', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename, metadata})
+    });
+    const data = await resp.json();
+    if (data.saved) {
+      showToast('Metadata saved');
+      document.getElementById('metaDialog').remove();
+      loadLoraFiles();
+    } else showToast(data.error || 'Save failed', true);
+  } catch (e) { showToast('Save failed', true); }
+}
+
+function pickLoraPreview(loraFilename) {
+  // Show image picker from current dataset
+  let html = '<div style="position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:500;display:flex;flex-direction:column;align-items:center;padding:30px;overflow:auto;" id="previewPicker">';
+  html += '<h3 style="color:#f39c12;margin-bottom:15px;">Select preview image for ' + loraFilename + '</h3>';
+  html += '<button class="btn-refresh" onclick="document.getElementById(\'previewPicker\').remove()" style="position:fixed;top:15px;right:20px;z-index:501;">Close</button>';
+  html += '<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;">';
+  allImages.forEach(img => {
+    html += '<img src="/img/' + encodeURIComponent(img.filename) + '" style="height:150px;border-radius:6px;cursor:pointer;border:3px solid transparent;" ' +
+      'onclick="setLoraPreview(\'' + loraFilename.replace(/'/g,"\\'") + '\',\'' + img.filename.replace(/'/g,"\\'") + '\')" ' +
+      'onmouseover="this.style.borderColor=\'#f39c12\'" onmouseout="this.style.borderColor=\'transparent\'" loading="lazy">';
+  });
+  html += '</div></div>';
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+
+async function setLoraPreview(loraFilename, imageFilename) {
+  try {
+    const resp = await fetch('/api/training/loras/preview', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename: loraFilename, image: imageFilename})
+    });
+    const data = await resp.json();
+    if (data.saved) {
+      showToast('Preview set');
+      document.getElementById('previewPicker').remove();
+      loadLoraFiles();
+    } else showToast(data.error || 'Failed', true);
+  } catch (e) { showToast('Failed', true); }
 }
 
 async function loadRunHistory() {
