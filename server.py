@@ -117,7 +117,7 @@ def _load_project(project_dir):
 
 def discover_projects(loras_dir):
     """Load projects from server.conf, or auto-discover from loras_dir."""
-    # Explicit list from server.conf takes priority
+    # Explicit list from server.conf takes priority, with auto-discovery fallback
     explicit_dirs = load_server_conf()
     if explicit_dirs:
         projects = []
@@ -127,7 +127,9 @@ def discover_projects(loras_dir):
                 projects.append(proj)
             else:
                 print(f"  Warning: skipping {d} (no project.conf or parse error)")
-        return projects
+        if projects:
+            return projects
+        print("  server.conf yielded no valid projects, falling back to auto-discovery")
 
     # Auto-discover: sibling dirs with project.conf
     projects = []
@@ -843,6 +845,7 @@ def make_handler(state):
             elif path == '/api/images':
                 images = get_images_with_categories(state.base_dir)
                 stats = compute_stats(images)
+                stats["current_repeats"] = int(state.conf.get("NUM_REPEATS", 10))
                 self._json_response({"images": images, "stats": stats})
             elif path.startswith('/api/caption/'):
                 self._get_caption(path[13:])
@@ -855,7 +858,9 @@ def make_handler(state):
                     self._json_response({"error": "Task not found"}, 404)
             elif path == '/api/stats':
                 images = get_images_with_categories(state.base_dir)
-                self._json_response(compute_stats(images))
+                stats = compute_stats(images)
+                stats["current_repeats"] = int(state.conf.get("NUM_REPEATS", 10))
+                self._json_response(stats)
             elif path == '/api/config':
                 self._get_config()
             elif path == '/api/projects':
@@ -2287,7 +2292,14 @@ function renderStats() {
   }
   html += '<br>';
   html += `<strong>Recommended:</strong> 30\u201350 images for character LoRAs<br>`;
-  html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.total * s.suggested_repeats} steps/epoch, aim for 200\u2013400)<br>`;
+  const curReps = s.current_repeats || '?';
+  const curSteps = s.current_repeats ? s.total * s.current_repeats : '?';
+  const sugSteps = s.total * s.suggested_repeats;
+  html += `<strong>NUM_REPEATS in project.conf:</strong> ${curReps} (~${curSteps} steps/epoch)`;
+  if (s.current_repeats && s.current_repeats !== s.suggested_repeats) {
+    html += ` \u2014 <span style="color:#f39c12">suggested: ${s.suggested_repeats} (~${sugSteps} steps/epoch, aim for 200\u2013400)</span>`;
+  }
+  html += '<br>';
   if (s.full_body_total > 0) {
     const fbPct = Math.round(s.full_body_facing / s.full_body_total * 100);
     html += `<strong>Full body facing camera:</strong> ${s.full_body_facing}/${s.full_body_total} (${fbPct}%)`;

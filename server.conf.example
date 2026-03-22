@@ -2,8 +2,8 @@
 # One directory per line. Supports $HOME expansion and relative paths.
 # Lines starting with # are comments. Empty lines are ignored.
 #
-# If this file exists, only listed projects appear in the dropdown.
-# If this file is absent, all sibling dirs with project.conf are auto-discovered.
+# Copy this to server.conf and edit the paths for your machine.
+# If server.conf is absent, all sibling dirs with project.conf are auto-discovered.
 
 $HOME/projects/loras/k3lly-young-lustify
 $HOME/projects/loras/k3lly-young-pony
