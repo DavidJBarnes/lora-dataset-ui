@@ -1565,6 +1565,13 @@ function renderStats() {
     face_closeup: 'Face Closeup', head_shoulders: 'Head/Shoulders',
     upper_body: 'Upper Body', full_body: 'Full Body', uncategorized: 'Uncategorized'
   };
+  const catDesc = {
+    face_closeup: 'Face fills frame. Cropped at chin/forehead. Eyes, nose, lips, skin texture.',
+    head_shoulders: 'Head to mid-chest. Classic portrait framing. Hair and neck visible.',
+    upper_body: 'Waist up. Arms, hands, torso. Clothing and body proportions.',
+    full_body: 'Head to feet. Full silhouette, proportions, legs, stance. Hardest for LoRAs \u2014 needs the most examples.',
+    uncategorized: 'No framing tag detected. Assign a category before training.'
+  };
 
   for (const cat of CATEGORY_ORDER) {
     const c = s.categories[cat];
@@ -1584,7 +1591,7 @@ function renderStats() {
     else status = '<span style="color:#2ecc71">ok</span>';
 
     html += `<tr>
-      <td>${catLabels[cat] || cat}</td>
+      <td><strong>${catLabels[cat] || cat}</strong><br><span style="color:#888;font-size:0.78em">${catDesc[cat] || ''}</span></td>
       <td>${c.count}</td>
       <td>${c.ideal_count}</td>
       <td>${pct}%</td>
