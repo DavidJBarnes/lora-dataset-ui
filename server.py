@@ -557,8 +557,8 @@ def get_lora_preview_path(project_dir, lora_filename):
 
 
 def list_sample_images(project_dir):
-    """List sample images from project's samples/ directory."""
-    samples_dir = os.path.join(project_dir, "samples")
+    """List sample images from project's outputs/sample/ directory."""
+    samples_dir = os.path.join(project_dir, "outputs", "sample")
     if not os.path.isdir(samples_dir):
         return []
     exts = {'.png', '.jpg', '.jpeg', '.webp'}
@@ -1350,7 +1350,7 @@ def make_handler(state):
 
         def _serve_sample_image(self, rel_path):
             proj = state.projects[state.current]
-            samples_dir = os.path.join(proj["dir"], "samples")
+            samples_dir = os.path.join(proj["dir"], "outputs", "sample")
             filepath = os.path.abspath(os.path.join(samples_dir, rel_path))
             if not filepath.startswith(os.path.abspath(samples_dir)):
                 self.send_error(403)
@@ -1411,7 +1411,7 @@ def make_handler(state):
         def _delete_samples(self, data):
             files = data.get('files', [])
             proj = state.projects[state.current]
-            samples_dir = os.path.join(proj["dir"], "samples")
+            samples_dir = os.path.join(proj["dir"], "outputs", "sample")
             deleted = []
             for f in files:
                 if '/' in f or '\\' in f:
