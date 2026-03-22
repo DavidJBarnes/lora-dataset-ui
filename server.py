@@ -3173,11 +3173,31 @@ async function loadTrainingSamples() {
       el.innerHTML = '<div style="color:#888;font-size:0.85em;">No samples yet</div>';
       return;
     }
-    let html = '<div style="margin-bottom:8px;">' +
-      '<button class="btn-delete" id="deleteSamplesBtn" disabled onclick="deleteSelectedSamples()" style="padding:5px 12px;font-size:0.8em;">Delete Selected (0)</button> ' +
-      '<button class="btn-select" onclick="selectAllSamples()" style="padding:5px 12px;font-size:0.8em;">Select All</button> ' +
-      '<button class="btn-select" onclick="selectedSamples.clear();loadTrainingSamples();" style="padding:5px 12px;font-size:0.8em;">Select None</button>' +
-      '</div>';
+    el.innerHTML = '';
+    // Toolbar
+    const toolbar = document.createElement('div');
+    toolbar.style.marginBottom = '8px';
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn-delete';
+    delBtn.id = 'deleteSamplesBtn';
+    delBtn.disabled = true;
+    delBtn.textContent = 'Delete Selected (0)';
+    delBtn.style.cssText = 'padding:5px 12px;font-size:0.8em;';
+    delBtn.onclick = deleteSelectedSamples;
+    const selAllBtn = document.createElement('button');
+    selAllBtn.className = 'btn-select';
+    selAllBtn.textContent = 'Select All';
+    selAllBtn.style.cssText = 'padding:5px 12px;font-size:0.8em;margin-left:5px;';
+    selAllBtn.onclick = selectAllSamples;
+    const selNoneBtn = document.createElement('button');
+    selNoneBtn.className = 'btn-select';
+    selNoneBtn.textContent = 'Select None';
+    selNoneBtn.style.cssText = 'padding:5px 12px;font-size:0.8em;margin-left:5px;';
+    selNoneBtn.onclick = () => { selectedSamples.clear(); loadTrainingSamples(); };
+    toolbar.appendChild(delBtn);
+    toolbar.appendChild(selAllBtn);
+    toolbar.appendChild(selNoneBtn);
+    el.appendChild(toolbar);
     // Group by epoch
     const byEpoch = {};
     data.samples.forEach(s => {
@@ -3186,17 +3206,26 @@ async function loadTrainingSamples() {
       byEpoch[key].push(s.filename);
     });
     for (const [epoch, files] of Object.entries(byEpoch)) {
-      html += '<div style="color:#f39c12;font-size:0.8em;font-weight:600;margin:10px 0 5px;">Epoch ' + epoch + '</div>';
-      html += '<div class="train-samples">';
+      const label = document.createElement('div');
+      label.style.cssText = 'color:#f39c12;font-size:0.8em;font-weight:600;margin:10px 0 5px;';
+      label.textContent = 'Epoch ' + epoch;
+      el.appendChild(label);
+      const grid = document.createElement('div');
+      grid.className = 'train-samples';
       files.forEach(fname => {
-        const esc = fname.replace(/'/g, "\\'");
-        html += '<div style="position:relative;display:inline-block;" onclick="toggleSampleSelect(\'' + esc + '\', this)">' +
-          '<img src="/api/training/sample/' + encodeURIComponent(fname) + '" title="' + fname + '" loading="lazy" style="border:3px solid transparent;">' +
-          '</div>';
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'position:relative;display:inline-block;';
+        wrap.onclick = function() { toggleSampleSelect(fname, this); };
+        const img = document.createElement('img');
+        img.src = '/api/training/sample/' + encodeURIComponent(fname);
+        img.title = fname;
+        img.loading = 'lazy';
+        img.style.border = '3px solid transparent';
+        wrap.appendChild(img);
+        grid.appendChild(wrap);
       });
-      html += '</div>';
+      el.appendChild(grid);
     }
-    el.innerHTML = html;
   } catch (e) {}
 }
 
