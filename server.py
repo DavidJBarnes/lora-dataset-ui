@@ -987,6 +987,8 @@ def make_handler(state):
                 self._rename_lora(self._read_body())
             elif path == '/api/training/samples/delete':
                 self._delete_samples(self._read_body())
+            elif path == '/api/training/loras/deploy':
+                self._deploy_lora(self._read_body())
             elif path == '/api/training/loras/metadata':
                 self._save_lora_metadata(self._read_body())
             elif path == '/api/config/update':
@@ -1530,6 +1532,42 @@ def make_handler(state):
             print(f"  Renamed LoRA: {old_name} -> {new_name}")
             self._json_response({"renamed": True, "old_name": old_name, "new_name": new_name})
 
+        def _deploy_lora(self, data):
+            """SCP a LoRA file to the 2070 inference machine."""
+            filename = data.get('filename', '')
+            if not filename or '/' in filename or '\\' in filename:
+                self._json_response({"error": "Invalid filename"}, 400)
+                return
+            proj = state.projects[state.current]
+            outputs_dir = os.path.join(proj["dir"], "outputs")
+            filepath = os.path.abspath(os.path.join(outputs_dir, filename))
+            if not filepath.startswith(os.path.abspath(outputs_dir)) or not os.path.isfile(filepath):
+                self._json_response({"error": "File not found"}, 404)
+                return
+            dest = "2070.zero:/home/david/StabilityMatrix-linux-x64/Data/Models/Lora/kelly/"
+            # Also deploy companion .json and .preview.png if they exist
+            files_to_send = [filepath]
+            base = filename.rsplit('.', 1)[0]
+            for ext in ['.json', '.preview.png']:
+                companion = os.path.join(outputs_dir, base + ext)
+                if os.path.isfile(companion):
+                    files_to_send.append(companion)
+            try:
+                result = subprocess.run(
+                    ["scp"] + files_to_send + [dest],
+                    capture_output=True, text=True, timeout=300,
+                )
+                if result.returncode == 0:
+                    names = [os.path.basename(f) for f in files_to_send]
+                    print(f"  Deployed to 2070: {', '.join(names)}")
+                    self._json_response({"deployed": True, "files": names})
+                else:
+                    self._json_response({"error": f"scp failed: {result.stderr[:200]}"}, 500)
+            except subprocess.TimeoutExpired:
+                self._json_response({"error": "Deploy timed out"}, 500)
+            except Exception as e:
+                self._json_response({"error": str(e)}, 500)
+
         def _delete_samples(self, data):
             files = data.get('files', [])
             proj = state.projects[state.current]
@@ -1820,7 +1858,7 @@ SPA_HTML = '''<!DOCTYPE html>
   .run-header .run-status.failed { color: #e74c3c; }
   .run-detail { padding: 10px 0; display: none; }
   .run-detail.open { display: block; }
-  .train-samples { display: flex; flex-wrap: wrap; gap: 8px; }
+  .train-samples { display: flex; flex-wrap: wrap; gap: 8px; width: 100%; }
   .train-samples img { height: 120px; border-radius: 4px; cursor: pointer; }
   .train-samples img:hover { opacity: 0.8; }
 
@@ -2966,6 +3004,7 @@ async function loadLoraFiles() {
           <a href="#" onclick="editLoraMetadata('${esc}'); return false;" style="color:#9b59b6;">Metadata</a>
           <a href="#" onclick="pickLoraPreview('${esc}'); return false;" style="color:#f39c12;">Set Preview</a>
           <a href="#" onclick="renameLora('${esc}'); return false;" style="color:#f39c12;">Rename</a>
+          <a href="#" onclick="deployLora('${esc}'); return false;" style="color:#2ecc71;">Deploy</a>
           <a href="#" onclick="deleteLora('${esc}'); return false;" style="color:#e74c3c;">Delete</a>
         </div>
       </div>`;
@@ -2998,6 +3037,20 @@ async function renameLora(oldName) {
     if (data.renamed) { showToast('Renamed to ' + data.new_name); loadLoraFiles(); }
     else showToast(data.error || 'Rename failed', true);
   } catch (e) { showToast('Rename failed', true); }
+}
+
+async function deployLora(filename) {
+  if (!confirm('Deploy ' + filename + ' to 2070 inference machine?')) return;
+  showToast('Deploying...');
+  try {
+    const resp = await fetch('/api/training/loras/deploy', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({filename})
+    });
+    const data = await resp.json();
+    if (data.deployed) showToast('Deployed: ' + data.files.join(', '));
+    else showToast(data.error || 'Deploy failed', true);
+  } catch (e) { showToast('Deploy failed', true); }
 }
 
 let _metaDialogFilename = '';
