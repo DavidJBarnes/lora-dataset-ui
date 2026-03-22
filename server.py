@@ -482,17 +482,18 @@ def get_images_with_categories(base_dir):
     return images
 
 
+MAX_RECOMMENDED = 80  # Character LoRAs: 20-80 images is the sweet spot
+
+
 def compute_stats(images):
     """Compute category balance stats from image list."""
     counts = Counter(img["category"] for img in images)
     total = len(images)
 
-    target_total = total
-    for cat in CATEGORY_ORDER:
-        ratio = IDEAL_RATIO.get(cat, 0)
-        count = counts.get(cat, 0)
-        if ratio > 0 and count > 0:
-            target_total = max(target_total, round(count / ratio))
+    # Target is based on current total, capped at the recommended max.
+    # Don't extrapolate from over-represented categories — that inflates
+    # the target wildly (e.g. 19 closeups at 10% → 190 target).
+    target_total = min(total, MAX_RECOMMENDED) if total > 0 else MAX_RECOMMENDED
 
     stats = {}
     for cat in CATEGORY_ORDER:
@@ -511,10 +512,15 @@ def compute_stats(images):
     facing_tags = ["looking_at_viewer", "looking at viewer", "facing viewer", "facing_viewer"]
     fb_images = [img for img in images if img["category"] == "full_body"]
     fb_facing = sum(1 for img in fb_images if any(t in img["caption"].lower() for t in facing_tags))
-    reps = 7 if target_total > 120 else 8 if target_total > 100 else 10 if target_total > 60 else 15
+
+    # Repeats: aim for ~200-400 steps/epoch
+    reps = max(1, round(300 / total)) if total > 0 else 10
+    oversized = total > MAX_RECOMMENDED
 
     return {
         "categories": stats, "total": total, "target_total": target_total,
+        "max_recommended": MAX_RECOMMENDED,
+        "oversized": oversized,
         "full_body_facing": fb_facing, "full_body_total": len(fb_images),
         "suggested_repeats": reps,
     }
@@ -1589,17 +1595,20 @@ function renderStats() {
   }
   html += '</table>';
 
-  const toGenerate = Object.values(s.categories).reduce((sum, c) => sum + c.deficit, 0);
   html += '<div class="stats-summary">';
-  html += `<strong>Current images:</strong> ${s.total}<br>`;
-  html += `<strong>Target dataset size:</strong> ${s.target_total}` + (toGenerate > 0 ? ` (need ~${toGenerate} more)` : '') + '<br>';
-  html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.target_total * s.suggested_repeats} steps/epoch)<br>`;
+  html += `<strong>Current images:</strong> ${s.total}`;
+  if (s.oversized) {
+    html += ` <span style="color:#e74c3c">(over ${s.max_recommended} recommended max — risk of overfitting)</span>`;
+  }
+  html += '<br>';
+  html += `<strong>Recommended:</strong> 20\u201380 images for character LoRAs<br>`;
+  html += `<strong>Suggested NUM_REPEATS:</strong> ${s.suggested_repeats} (~${s.total * s.suggested_repeats} steps/epoch, aim for 200\u2013400)<br>`;
   if (s.full_body_total > 0) {
     const fbPct = Math.round(s.full_body_facing / s.full_body_total * 100);
     html += `<strong>Full body facing camera:</strong> ${s.full_body_facing}/${s.full_body_total} (${fbPct}%)`;
     const target = Math.round(s.full_body_total * 0.7);
     if (s.full_body_facing < target) {
-      html += ` — need ~${target - s.full_body_facing} more front-facing`;
+      html += ` \u2014 need ~${target - s.full_body_facing} more front-facing`;
     }
     html += '<br>';
   }
