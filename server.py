@@ -97,14 +97,23 @@ def _load_project(project_dir):
     except (SystemExit, Exception):
         return None
     model = detect_model(project_dir, pconf)
-    # Always compute dataset_dir relative to the actual project directory,
-    # not PROJECT_DIR from conf (which may point elsewhere)
+    # Find the actual dataset subset directory on disk.
+    # The subset name is {NUM_REPEATS}_{TRIGGER}_{CLASS}, but NUM_REPEATS
+    # may have changed since the directory was created. Search for any
+    # directory matching *_{TRIGGER}_{CLASS} and use it.
     trigger = pconf.get("TRIGGER", "trigger")
     cls = pconf.get("CLASS", "woman")
     repeats = pconf.get("NUM_REPEATS", "10")
     dataset_subdir = pconf.get("DATASET_DIR", "dataset/img")
-    subset_name = f"{repeats}_{trigger}_{cls}"
-    dataset_dir = os.path.join(project_dir, dataset_subdir, subset_name)
+    img_parent = os.path.join(project_dir, dataset_subdir)
+    suffix = f"_{trigger}_{cls}"
+    dataset_dir = os.path.join(img_parent, f"{repeats}{suffix}")
+    # If computed path doesn't exist, scan for matching directory
+    if not os.path.isdir(dataset_dir) and os.path.isdir(img_parent):
+        for entry in os.listdir(img_parent):
+            if entry.endswith(suffix) and os.path.isdir(os.path.join(img_parent, entry)):
+                dataset_dir = os.path.join(img_parent, entry)
+                break
     return {
         "name": os.path.basename(project_dir),
         "dir": project_dir,
@@ -168,8 +177,13 @@ class ServerState:
         self.model = proj["model"]
         self.conf_path = proj["conf_path"]
         self.conf = load_conf(self.conf_path)
-        self.base_dir = proj["dataset_dir"]
-        # Ensure dataset dir exists
+        # Re-resolve dataset dir (NUM_REPEATS may have changed)
+        reloaded = _load_project(proj["dir"])
+        if reloaded:
+            self.base_dir = reloaded["dataset_dir"]
+            proj["dataset_dir"] = reloaded["dataset_dir"]
+        else:
+            self.base_dir = proj["dataset_dir"]
         if not os.path.isdir(self.base_dir):
             os.makedirs(self.base_dir, exist_ok=True)
         return True
