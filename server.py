@@ -491,9 +491,8 @@ def compute_stats(images):
     total = len(images)
 
     # Target is based on current total, capped at the recommended max.
-    # Don't extrapolate from over-represented categories — that inflates
-    # the target wildly (e.g. 19 closeups at 10% → 190 target).
-    target_total = min(total, MAX_RECOMMENDED) if total > 0 else MAX_RECOMMENDED
+    # Always target MAX_RECOMMENDED so the table shows what to aim for.
+    target_total = MAX_RECOMMENDED
 
     stats = {}
     for cat in CATEGORY_ORDER:
