@@ -5,10 +5,13 @@ server.py — Dataset preparation SPA for LoRA training.
 Category-based image browser with integrated WD14 tagging, caption editing,
 and dataset balance analysis. Single-page app served from one file.
 
+Discovers sibling project directories (those with project.conf) and lets
+you switch between them from a dropdown in the header.
+
 Usage:
-    python server.py --model lustify
-    python server.py --model pony --port 9000
-    python server.py --model lustify --dir dataset/img/10_k3lly-young_woman
+    python server.py                        # Auto-discover projects
+    python server.py --port 9000            # Custom port
+    python server.py --loras-dir /path/to   # Explicit parent directory
 
 Controls:
     Click          = select/deselect for deletion
@@ -24,19 +27,144 @@ import argparse
 import json
 import mimetypes
 import os
-import re
 import subprocess
 import sys
 import threading
-import time
 import uuid
+from collections import Counter
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse, parse_qs
 
-import project_config
-from project_config import load_conf, CONF_FILE
+from project_config import load_conf
 
-conf = project_config.conf
+# ---------------------------------------------------------------------------
+# Project discovery
+# ---------------------------------------------------------------------------
+
+def detect_model(project_dir, conf):
+    """Determine model type from conf or directory name."""
+    model = conf.get("MODEL", "").lower()
+    if model in ("pony", "lustify"):
+        return model
+    dirname = os.path.basename(project_dir).lower()
+    if "pony" in dirname:
+        return "pony"
+    if "lustify" in dirname:
+        return "lustify"
+    return "lustify"
+
+
+SERVER_CONF = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.conf")
+
+
+def load_server_conf():
+    """Load server.conf — returns list of project directory paths."""
+    dirs = []
+    if not os.path.isfile(SERVER_CONF):
+        return dirs
+    home = os.path.expanduser("~")
+    with open(SERVER_CONF, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            line = line.replace("$HOME", home)
+            if os.path.isabs(line):
+                dirs.append(line)
+            else:
+                # Relative to the server.conf directory
+                dirs.append(os.path.join(os.path.dirname(SERVER_CONF), line))
+    return dirs
+
+
+def _load_project(project_dir):
+    """Load a single project from a directory. Returns dict or None."""
+    project_dir = os.path.abspath(project_dir)
+    if not os.path.isdir(project_dir):
+        return None
+    conf_path = os.path.join(project_dir, "project.conf")
+    if not os.path.isfile(conf_path):
+        return None
+    try:
+        pconf = load_conf(conf_path)
+    except (SystemExit, Exception):
+        return None
+    model = detect_model(project_dir, pconf)
+    # Always compute dataset_dir relative to the actual project directory,
+    # not PROJECT_DIR from conf (which may point elsewhere)
+    trigger = pconf.get("TRIGGER", "trigger")
+    cls = pconf.get("CLASS", "woman")
+    repeats = pconf.get("NUM_REPEATS", "10")
+    dataset_subdir = pconf.get("DATASET_DIR", "dataset/img")
+    subset_name = f"{repeats}_{trigger}_{cls}"
+    dataset_dir = os.path.join(project_dir, dataset_subdir, subset_name)
+    return {
+        "name": os.path.basename(project_dir),
+        "dir": project_dir,
+        "model": model,
+        "trigger": pconf.get("TRIGGER", ""),
+        "conf_path": conf_path,
+        "dataset_dir": dataset_dir,
+    }
+
+
+def discover_projects(loras_dir):
+    """Load projects from server.conf, or auto-discover from loras_dir."""
+    # Explicit list from server.conf takes priority
+    explicit_dirs = load_server_conf()
+    if explicit_dirs:
+        projects = []
+        for d in explicit_dirs:
+            proj = _load_project(d)
+            if proj:
+                projects.append(proj)
+            else:
+                print(f"  Warning: skipping {d} (no project.conf or parse error)")
+        return projects
+
+    # Auto-discover: sibling dirs with project.conf
+    projects = []
+    server_dir = os.path.abspath(os.path.dirname(__file__))
+    for entry in sorted(os.listdir(loras_dir)):
+        project_dir = os.path.join(loras_dir, entry)
+        if not os.path.isdir(project_dir):
+            continue
+        if os.path.abspath(project_dir) == server_dir:
+            continue
+        proj = _load_project(project_dir)
+        if proj:
+            projects.append(proj)
+    return projects
+
+
+class ServerState:
+    """Mutable server state that allows switching between projects."""
+
+    def __init__(self, projects):
+        self.projects = {p["name"]: p for p in projects}
+        self.project_list = projects
+        self.current = None
+        self.conf = {}
+        self.conf_path = ""
+        self.base_dir = ""
+        self.model = ""
+        if projects:
+            self.switch_to(projects[0]["name"])
+
+    def switch_to(self, name):
+        if name not in self.projects:
+            return False
+        proj = self.projects[name]
+        self.current = name
+        self.model = proj["model"]
+        self.conf_path = proj["conf_path"]
+        self.conf = load_conf(self.conf_path)
+        self.base_dir = proj["dataset_dir"]
+        # Ensure dataset dir exists
+        if not os.path.isdir(self.base_dir):
+            os.makedirs(self.base_dir, exist_ok=True)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Category detection (from analyze_dataset.py)
@@ -85,7 +213,6 @@ CATEGORY_ORDER = ["face_closeup", "head_shoulders", "upper_body", "full_body", "
 def categorize_caption(caption_text):
     """Return category string based on tags found in caption."""
     text_lower = caption_text.lower()
-    # Check order: face_closeup → upper_body → full_body → head_shoulders
     for tag in CATEGORY_TAGS["face_closeup"]:
         if tag in text_lower:
             return "face_closeup"
@@ -125,7 +252,7 @@ REMOVE_TAGS = {
 REMOVE_TAGS_LOWER = {t.lower() for t in REMOVE_TAGS}
 
 
-def make_prefix(model):
+def make_prefix(model, conf):
     """Build the caption prefix for a given model."""
     trigger = conf.get("TRIGGER", "trigger")
     cls = conf.get("CLASS", "woman")
@@ -134,17 +261,15 @@ def make_prefix(model):
     return f"{trigger} {cls}"
 
 
-def strip_prefix(caption, model):
+def strip_prefix(caption, model, conf):
     """Remove any existing model prefix from the start of a caption."""
     trigger = conf.get("TRIGGER", "trigger")
     cls = conf.get("CLASS", "woman")
     pony_prefix = f"score_9, score_8_up, score_7_up, source_realistic, {trigger} {cls}"
     lustify_prefix = f"{trigger} {cls}"
-    # Strip pony first (longer), then lustify
     for pfx in [pony_prefix, lustify_prefix]:
         if caption.startswith(pfx):
-            caption = caption[len(pfx):]
-            caption = caption.lstrip(", ")
+            caption = caption[len(pfx):].lstrip(", ")
             break
     return caption
 
@@ -161,22 +286,15 @@ def dedupe_tags(tags):
     return result
 
 
-def cleanup_caption(raw_caption, model):
+def cleanup_caption(raw_caption, model, conf):
     """Clean a raw WD14 caption: remove character tags, dedupe, add model prefix."""
-    # Strip any existing prefix
-    text = strip_prefix(raw_caption.strip(), model)
-    # Split into tags
+    text = strip_prefix(raw_caption.strip(), model, conf)
     tags = [t.strip() for t in text.split(",")]
-    # Remove character-specific tags
     tags = [t for t in tags if t and t.lower() not in REMOVE_TAGS_LOWER]
-    # Deduplicate
     tags = dedupe_tags(tags)
-    # Rebuild
-    prefix = make_prefix(model)
+    prefix = make_prefix(model, conf)
     cleaned = ", ".join(tags)
-    if cleaned:
-        return f"{prefix}, {cleaned}"
-    return prefix
+    return f"{prefix}, {cleaned}" if cleaned else prefix
 
 
 # ---------------------------------------------------------------------------
@@ -192,11 +310,8 @@ def create_task(name):
     task_id = str(uuid.uuid4())[:8]
     with _tasks_lock:
         _tasks[task_id] = {
-            "name": name,
-            "status": "running",
-            "progress": "",
-            "message": "Starting...",
-            "error": None,
+            "name": name, "status": "running",
+            "progress": "", "message": "Starting...", "error": None,
         }
     return task_id
 
@@ -216,34 +331,29 @@ def get_task(task_id):
 # WD14 Tagger integration
 # ---------------------------------------------------------------------------
 
-def merge_captions(existing_caption, wd14_raw, model):
-    """Merge WD14 tags into an existing caption, preserving user tags. Dedupes."""
-    # Parse existing caption: strip prefix, split into tags
-    existing_stripped = strip_prefix(existing_caption.strip(), model)
+def merge_captions(existing_caption, wd14_raw, model, conf):
+    """Merge WD14 tags into an existing caption, preserving user tags."""
+    existing_stripped = strip_prefix(existing_caption.strip(), model, conf)
     existing_tags = [t.strip() for t in existing_stripped.split(",") if t.strip()]
     existing_lower = {t.lower() for t in existing_tags}
 
-    # Parse WD14 output into tags, apply cleanup (remove character tags)
     wd14_tags = [t.strip() for t in wd14_raw.split(",") if t.strip()]
     wd14_tags = [t for t in wd14_tags if t and t.lower() not in REMOVE_TAGS_LOWER]
 
-    # Add WD14 tags that aren't already present
     for tag in wd14_tags:
         if tag.lower() not in existing_lower:
             existing_tags.append(tag)
             existing_lower.add(tag.lower())
 
-    # Dedupe and rebuild with prefix
     tags = dedupe_tags(existing_tags)
-    prefix = make_prefix(model)
+    prefix = make_prefix(model, conf)
     cleaned = ", ".join(t for t in tags if t)
-    if cleaned:
-        return f"{prefix}, {cleaned}"
-    return prefix
+    return f"{prefix}, {cleaned}" if cleaned else prefix
 
 
-def run_tagger_task(task_id, dataset_dir, model):
+def run_tagger_task(task_id, dataset_dir, model, conf):
     """Background task: run WD14 tagger on all images, merge with existing captions."""
+    existing_captions = {}
     try:
         sd_scripts = conf.get("SD_SCRIPTS", "")
         if not sd_scripts or not os.path.isdir(sd_scripts):
@@ -260,8 +370,6 @@ def run_tagger_task(task_id, dataset_dir, model):
             update_task(task_id, status="failed", error=f"Tagger script not found: {tagger_script}")
             return
 
-        # Step 1: Back up and remove existing captions so tagger processes all images
-        existing_captions = {}
         image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
         image_files = [f for f in os.listdir(dataset_dir)
                        if os.path.splitext(f)[1].lower() in image_exts]
@@ -274,7 +382,6 @@ def run_tagger_task(task_id, dataset_dir, model):
                     existing_captions[txt_file] = f.read().strip()
                 os.remove(txt_path)
 
-        # Step 2: Run WD14 tagger on ALL images (no .txt files exist, so it tags everything)
         gpu = conf.get("TAGGER_GPU", "false").lower() == "true"
         batch_size = "8" if gpu else "1"
         update_task(task_id, progress=f"0/{len(image_files)}",
@@ -283,17 +390,13 @@ def run_tagger_task(task_id, dataset_dir, model):
         model_dir = os.path.join(sd_scripts, "wd14_models")
         cmd = [
             venv_python, tagger_script,
-            "--onnx",
-            "--batch_size", batch_size,
-            "--thresh", "0.35",
-            "--caption_extension", ".txt",
-            "--model_dir", model_dir,
-            dataset_dir,
+            "--onnx", "--batch_size", batch_size,
+            "--thresh", "0.35", "--caption_extension", ".txt",
+            "--model_dir", model_dir, dataset_dir,
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if result.returncode != 0:
-            # Restore backups on failure
             for txt_file, content in existing_captions.items():
                 with open(os.path.join(dataset_dir, txt_file), 'w') as f:
                     f.write(content)
@@ -301,24 +404,18 @@ def run_tagger_task(task_id, dataset_dir, model):
                         error=f"Auto-caption failed: {result.stderr[:500]}")
             return
 
-        # Step 3: For each image, merge WD14 output with existing user tags
         processed = 0
         for img_file in image_files:
             txt_file = os.path.splitext(img_file)[0] + '.txt'
             txt_path = os.path.join(dataset_dir, txt_file)
             if not os.path.isfile(txt_path):
                 continue
-
             with open(txt_path, 'r') as f:
                 wd14_raw = f.read().strip()
-
             if txt_file in existing_captions:
-                # Merge: keep user tags, add new WD14 tags
-                merged = merge_captions(existing_captions[txt_file], wd14_raw, model)
+                merged = merge_captions(existing_captions[txt_file], wd14_raw, model, conf)
             else:
-                # New caption: just clean up
-                merged = cleanup_caption(wd14_raw, model)
-
+                merged = cleanup_caption(wd14_raw, model, conf)
             with open(txt_path, 'w') as f:
                 f.write(merged)
             processed += 1
@@ -328,7 +425,6 @@ def run_tagger_task(task_id, dataset_dir, model):
                     message=f"Auto-captioned {processed} images")
 
     except (subprocess.TimeoutExpired, Exception) as e:
-        # Restore backups on any failure
         for txt_file, content in existing_captions.items():
             with open(os.path.join(dataset_dir, txt_file), 'w') as f:
                 f.write(content)
@@ -347,49 +443,36 @@ def get_images_with_categories(base_dir):
     images = []
     if not os.path.isdir(base_dir):
         return images
-
     for filename in sorted(os.listdir(base_dir)):
         ext = os.path.splitext(filename)[1].lower()
         if ext not in IMAGE_EXTENSIONS:
             continue
-
         txt_path = os.path.join(base_dir, os.path.splitext(filename)[0] + '.txt')
         has_caption = os.path.isfile(txt_path)
         caption = ""
         category = "uncategorized"
-
         if has_caption:
             with open(txt_path, 'r') as f:
                 caption = f.read().strip()
             category = categorize_caption(caption)
-
         images.append({
-            "filename": filename,
-            "has_caption": has_caption,
-            "caption": caption,
-            "category": category,
+            "filename": filename, "has_caption": has_caption,
+            "caption": caption, "category": category,
         })
-
     return images
 
 
 def compute_stats(images):
     """Compute category balance stats from image list."""
-    from collections import Counter
     counts = Counter(img["category"] for img in images)
     total = len(images)
 
-    # Compute target dataset size: for each category, determine the minimum
-    # total that would make the current count fit within its ideal ratio.
-    # The largest of these drives the target size.
-    # e.g., 17 face closeups at 10% ideal → need 170 total to be balanced.
     target_total = total
     for cat in CATEGORY_ORDER:
         ratio = IDEAL_RATIO.get(cat, 0)
         count = counts.get(cat, 0)
         if ratio > 0 and count > 0:
-            implied_total = round(count / ratio)
-            target_total = max(target_total, implied_total)
+            target_total = max(target_total, round(count / ratio))
 
     stats = {}
     for cat in CATEGORY_ORDER:
@@ -400,29 +483,19 @@ def compute_stats(images):
         deficit = max(0, ideal_count - count)
         surplus = max(0, count - ideal_count) if ideal_count > 0 else 0
         stats[cat] = {
-            "count": count,
-            "current_pct": round(current_pct, 1),
-            "ideal_pct": ideal_pct,
-            "ideal_count": ideal_count,
-            "deficit": deficit,
-            "surplus": surplus,
+            "count": count, "current_pct": round(current_pct, 1),
+            "ideal_pct": ideal_pct, "ideal_count": ideal_count,
+            "deficit": deficit, "surplus": surplus,
         }
 
-    # Front-facing ratio for full_body
     facing_tags = ["looking_at_viewer", "looking at viewer", "facing viewer", "facing_viewer"]
     fb_images = [img for img in images if img["category"] == "full_body"]
     fb_facing = sum(1 for img in fb_images if any(t in img["caption"].lower() for t in facing_tags))
-    fb_total = len(fb_images)
-
-    # Suggested repeats based on target size
     reps = 7 if target_total > 120 else 8 if target_total > 100 else 10 if target_total > 60 else 15
 
     return {
-        "categories": stats,
-        "total": total,
-        "target_total": target_total,
-        "full_body_facing": fb_facing,
-        "full_body_total": fb_total,
+        "categories": stats, "total": total, "target_total": target_total,
+        "full_body_facing": fb_facing, "full_body_total": len(fb_images),
         "suggested_repeats": reps,
     }
 
@@ -431,18 +504,17 @@ def compute_stats(images):
 # HTTP Server
 # ---------------------------------------------------------------------------
 
-def make_handler(base_dir, model):
+def make_handler(state):
 
     class Handler(BaseHTTPRequestHandler):
 
         def log_message(self, format, *args):
-            # Only log errors
             if args and '404' in str(args[0]):
                 super().log_message(format, *args)
 
         def _read_body(self):
             length = int(self.headers.get('Content-Length', 0))
-            if length > 1_000_000:  # 1MB limit
+            if length > 1_000_000:
                 return {}
             return json.loads(self.rfile.read(length).decode('utf-8'))
 
@@ -454,11 +526,12 @@ def make_handler(base_dir, model):
             self.wfile.write(json.dumps(data).encode())
 
         def do_GET(self):
-            path = unquote(self.path)
+            parsed = urlparse(self.path)
+            path = unquote(parsed.path)
             if path == '/' or path == '':
                 self._serve_html()
             elif path == '/api/images':
-                images = get_images_with_categories(base_dir)
+                images = get_images_with_categories(state.base_dir)
                 stats = compute_stats(images)
                 self._json_response({"images": images, "stats": stats})
             elif path.startswith('/api/caption/'):
@@ -471,10 +544,12 @@ def make_handler(base_dir, model):
                 else:
                     self._json_response({"error": "Task not found"}, 404)
             elif path == '/api/stats':
-                images = get_images_with_categories(base_dir)
+                images = get_images_with_categories(state.base_dir)
                 self._json_response(compute_stats(images))
             elif path == '/api/config':
                 self._get_config()
+            elif path == '/api/projects':
+                self._get_projects()
             elif path.startswith('/img/'):
                 self._serve_image(path[5:])
             elif path == '/favicon.ico':
@@ -484,7 +559,7 @@ def make_handler(base_dir, model):
                 self.send_error(404)
 
         def do_POST(self):
-            path = unquote(self.path)
+            path = unquote(urlparse(self.path).path)
             if path == '/api/delete':
                 self._handle_delete(self._read_body())
             elif path.startswith('/api/caption/'):
@@ -497,25 +572,37 @@ def make_handler(base_dir, model):
                 self._save_config(self._read_body())
             elif path == '/api/setup':
                 self._handle_setup()
+            elif path == '/api/switch-project':
+                self._switch_project(self._read_body())
             else:
                 self.send_error(404)
 
+        def do_OPTIONS(self):
+            self.send_response(200)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+            self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+            self.end_headers()
+
         def _serve_html(self):
             html = SPA_HTML
-            html = html.replace('{{DATASET_DIR}}', os.path.abspath(base_dir))
-            html = html.replace('{{MODEL}}', model)
+            html = html.replace('{{DATASET_DIR}}', os.path.abspath(state.base_dir))
+            html = html.replace('{{MODEL}}', state.model)
             html = html.replace('{{CATEGORY_TAGS_JSON}}', json.dumps(CATEGORY_TAGS))
             html = html.replace('{{CATEGORY_PRIMARY_TAG_JSON}}', json.dumps(CATEGORY_PRIMARY_TAG))
+            html = html.replace('{{PROJECTS_JSON}}', json.dumps([
+                {"name": p["name"], "model": p["model"], "trigger": p["trigger"],
+                 "active": p["name"] == state.current}
+                for p in state.project_list
+            ]))
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.end_headers()
             self.wfile.write(html.encode())
 
         def _serve_image(self, rel_path):
-            filepath = os.path.join(base_dir, rel_path)
-            # Path traversal protection
-            filepath = os.path.abspath(filepath)
-            if not filepath.startswith(os.path.abspath(base_dir)):
+            filepath = os.path.abspath(os.path.join(state.base_dir, rel_path))
+            if not filepath.startswith(os.path.abspath(state.base_dir)):
                 self.send_error(403)
                 return
             if not os.path.isfile(filepath):
@@ -533,9 +620,8 @@ def make_handler(base_dir, model):
                 pass
 
         def _get_caption(self, rel_path):
-            img_path = os.path.join(base_dir, rel_path)
-            img_path = os.path.abspath(img_path)
-            if not img_path.startswith(os.path.abspath(base_dir)):
+            img_path = os.path.abspath(os.path.join(state.base_dir, rel_path))
+            if not img_path.startswith(os.path.abspath(state.base_dir)):
                 self.send_error(403)
                 return
             txt_path = os.path.splitext(img_path)[0] + '.txt'
@@ -546,14 +632,12 @@ def make_handler(base_dir, model):
             self._json_response({'caption': caption, 'file': rel_path})
 
         def _save_caption(self, rel_path, data):
-            img_path = os.path.join(base_dir, rel_path)
-            img_path = os.path.abspath(img_path)
-            if not img_path.startswith(os.path.abspath(base_dir)):
+            img_path = os.path.abspath(os.path.join(state.base_dir, rel_path))
+            if not img_path.startswith(os.path.abspath(state.base_dir)):
                 self.send_error(403)
                 return
             txt_path = os.path.splitext(img_path)[0] + '.txt'
             caption = data.get('caption', '')
-            # Deduplicate tags before saving
             tags = dedupe_tags([t.strip() for t in caption.split(',')])
             caption = ', '.join(t for t in tags if t)
             with open(txt_path, 'w') as f:
@@ -566,8 +650,8 @@ def make_handler(base_dir, model):
             files = data.get('files', [])
             deleted = []
             for rel_path in files:
-                filepath = os.path.abspath(os.path.join(base_dir, rel_path))
-                if not filepath.startswith(os.path.abspath(base_dir)):
+                filepath = os.path.abspath(os.path.join(state.base_dir, rel_path))
+                if not filepath.startswith(os.path.abspath(state.base_dir)):
                     continue
                 if os.path.isfile(filepath):
                     os.remove(filepath)
@@ -580,9 +664,10 @@ def make_handler(base_dir, model):
 
         def _handle_tag(self, data):
             task_id = create_task("WD14 Tagger")
+            # Capture current state for the background thread
             thread = threading.Thread(
                 target=run_tagger_task,
-                args=(task_id, os.path.abspath(base_dir), model),
+                args=(task_id, os.path.abspath(state.base_dir), state.model, dict(state.conf)),
                 daemon=True,
             )
             thread.start()
@@ -595,8 +680,8 @@ def make_handler(base_dir, model):
                 self._json_response({"error": "Invalid category"}, 400)
                 return
 
-            filepath = os.path.abspath(os.path.join(base_dir, filename))
-            if not filepath.startswith(os.path.abspath(base_dir)):
+            filepath = os.path.abspath(os.path.join(state.base_dir, filename))
+            if not filepath.startswith(os.path.abspath(state.base_dir)):
                 self.send_error(403)
                 return
 
@@ -606,20 +691,16 @@ def make_handler(base_dir, model):
                 with open(txt_path, 'r') as f:
                     caption = f.read().strip()
 
-            # Remove all existing category tags
             tags = [t.strip() for t in caption.split(',')]
             all_cat_tags = set()
             for tag_list in CATEGORY_TAGS.values():
                 all_cat_tags.update(t.lower() for t in tag_list)
-
             cleaned_tags = [t for t in tags if t.lower() not in all_cat_tags]
 
-            # Find insertion point: after the prefix
-            prefix = make_prefix(model)
+            prefix = make_prefix(state.model, state.conf)
             prefix_tags = [t.strip() for t in prefix.split(',')]
             prefix_len = len(prefix_tags)
 
-            # Insert the new category tag after the prefix, then dedupe
             new_tag = CATEGORY_PRIMARY_TAG[new_category]
             result_tags = cleaned_tags[:prefix_len] + [new_tag] + cleaned_tags[prefix_len:]
             result_tags = dedupe_tags(result_tags)
@@ -630,44 +711,38 @@ def make_handler(base_dir, model):
 
             print(f"  Set category: {filename} -> {new_category}")
             self._json_response({
-                'saved': True,
-                'filename': filename,
-                'category': new_category,
-                'caption': new_caption,
+                'saved': True, 'filename': filename,
+                'category': new_category, 'caption': new_caption,
             })
 
         def _get_config(self):
-            """Return project.conf raw content and parsed key-value pairs."""
             raw = ''
-            if os.path.isfile(CONF_FILE):
-                with open(CONF_FILE, 'r') as f:
+            if os.path.isfile(state.conf_path):
+                with open(state.conf_path, 'r') as f:
                     raw = f.read()
             self._json_response({
-                'raw': raw,
-                'path': CONF_FILE,
-                'model': model,
+                'raw': raw, 'path': state.conf_path, 'model': state.model,
             })
 
         def _save_config(self, data):
-            """Save project.conf content and reload."""
-            global conf
             raw = data.get('raw', '')
             if not raw.strip():
                 self._json_response({'error': 'Empty config'}, 400)
                 return
-            with open(CONF_FILE, 'w') as f:
-                f.write(raw)
-            # Reload config globally
-            new_conf = load_conf()
-            conf = new_conf
-            project_config.conf = new_conf
-            print(f"  Saved project.conf ({len(raw)} bytes)")
-            self._json_response({'saved': True})
+            try:
+                with open(state.conf_path, 'w') as f:
+                    f.write(raw)
+                state.conf = load_conf(state.conf_path)
+                print(f"  Saved project.conf ({len(raw)} bytes)")
+                self._json_response({'saved': True})
+            except SystemExit:
+                self._json_response({'error': 'Config parse error'}, 400)
+            except Exception as e:
+                self._json_response({'error': str(e)}, 500)
 
         def _handle_setup(self):
-            """Create project directory structure from current config."""
-            project_dir = conf.get("PROJECT_DIR", ".")
-            dataset_path = conf.get("DATASET_PATH", "dataset/img")
+            project_dir = state.conf.get("PROJECT_DIR", ".")
+            dataset_path = state.conf.get("DATASET_PATH", "dataset/img")
             dirs = [
                 os.path.join(project_dir, dataset_path),
                 os.path.join(project_dir, "outputs"),
@@ -685,6 +760,30 @@ def make_handler(base_dir, model):
                 'created': created,
                 'message': f"Created {len(created)} directories" if created else "All directories already exist",
             })
+
+        def _get_projects(self):
+            self._json_response({
+                'projects': [
+                    {"name": p["name"], "model": p["model"], "trigger": p["trigger"],
+                     "active": p["name"] == state.current}
+                    for p in state.project_list
+                ],
+                'current': state.current,
+            })
+
+        def _switch_project(self, data):
+            name = data.get('name', '')
+            if state.switch_to(name):
+                img_count = sum(1 for f in os.listdir(state.base_dir)
+                                if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS) if os.path.isdir(state.base_dir) else 0
+                print(f"  Switched to: {name} ({state.model}, {img_count} images)")
+                self._json_response({
+                    'switched': True, 'name': name,
+                    'model': state.model,
+                    'dataset_dir': os.path.abspath(state.base_dir),
+                })
+            else:
+                self._json_response({'error': f'Unknown project: {name}'}, 400)
 
     return Handler
 
@@ -707,6 +806,9 @@ SPA_HTML = '''<!DOCTYPE html>
   .header { padding: 12px 20px; border-bottom: 1px solid #333; display: flex; align-items: center; gap: 15px; }
   .header h1 { font-size: 1.2em; white-space: nowrap; }
   .header .meta { color: #888; font-size: 0.8em; }
+  .header select { background: #0f3460; color: #f39c12; border: 1px solid #555; border-radius: 6px;
+                   padding: 6px 12px; font-size: 0.85em; font-weight: 600; cursor: pointer; }
+  .header select:focus { outline: none; border-color: #f39c12; }
 
   /* Tabs */
   .tabs { display: flex; border-bottom: 2px solid #333; padding: 0 10px; background: #16213e;
@@ -854,6 +956,7 @@ SPA_HTML = '''<!DOCTYPE html>
 
 <div class="header">
   <h1>Dataset Prep</h1>
+  <select id="projectSwitcher" onchange="switchProject(this.value)"></select>
   <span class="meta" id="headerMeta">{{DATASET_DIR}} | {{MODEL}}</span>
 </div>
 
@@ -947,17 +1050,52 @@ const QUICK_TAGS = [
   'from_above', 'from_below', 'from_side', 'from_behind',
   'outdoors', 'indoors', 'simple_background',
 ];
+let PROJECTS = JSON.parse('{{PROJECTS_JSON}}');
 
 // --- State ---
-let allImages = [];       // [{filename, has_caption, caption, category}, ...]
-let filteredImages = [];   // Current tab's subset
-let selected = new Set();  // Selected filenames
+let allImages = [];
+let filteredImages = [];
+let selected = new Set();
 let activeTab = 'uncategorized';
-let modalIdx = -1;         // Index into filteredImages
+let modalIdx = -1;
 let isDirty = false;
 let originalCaption = '';
 let currentStats = null;
 let activeTaskId = null;
+
+// --- Project switcher ---
+function initProjectSwitcher() {
+  const sel = document.getElementById('projectSwitcher');
+  sel.innerHTML = '';
+  PROJECTS.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = p.name;
+    opt.textContent = p.name + ' (' + p.model + ')';
+    opt.selected = p.active;
+    sel.appendChild(opt);
+  });
+}
+
+async function switchProject(name) {
+  try {
+    const resp = await fetch('/api/switch-project', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name})
+    });
+    const data = await resp.json();
+    if (data.switched) {
+      document.getElementById('headerMeta').textContent = data.dataset_dir + ' | ' + data.model;
+      selected.clear();
+      configDirty = false;
+      PROJECTS.forEach(p => p.active = p.name === name);
+      showToast('Switched to ' + name);
+      loadImages();
+      if (activeTab === 'config') loadConfig();
+    } else {
+      showToast('Switch failed: ' + (data.error || 'unknown'), true);
+    }
+  } catch (e) { showToast('Switch failed: ' + e.message, true); }
+}
 
 // --- Category detection (mirrors Python) ---
 function categorizeCaption(text) {
@@ -982,13 +1120,9 @@ function switchTab(tab) {
   document.getElementById('statsView').style.display = tab === 'stats' ? '' : 'none';
   document.getElementById('configView').style.display = tab === 'config' ? '' : 'none';
 
-  if (tab === 'stats') {
-    renderStats();
-  } else if (tab === 'config') {
-    loadConfig();
-  } else {
-    renderGrid();
-  }
+  if (tab === 'stats') renderStats();
+  else if (tab === 'config') loadConfig();
+  else renderGrid();
 }
 
 function updateBadges() {
@@ -1016,7 +1150,7 @@ async function loadImages() {
     currentStats = data.stats;
     updateBadges();
     if (activeTab === 'stats') renderStats();
-    else renderGrid();
+    else if (activeTab !== 'config') renderGrid();
   } catch (e) {
     showToast('Failed to load images: ' + e.message, true);
   }
@@ -1152,7 +1286,6 @@ async function openModal(idx) {
   document.getElementById('modalInfo').textContent = img.filename + ' (' + (idx + 1) + '/' + filteredImages.length + ')';
   document.getElementById('modal').classList.add('active');
 
-  // Load fresh caption
   try {
     const resp = await fetch('/api/caption/' + encodeURIComponent(img.filename));
     const data = await resp.json();
@@ -1220,7 +1353,6 @@ async function setCategory(cat) {
       document.getElementById('saveBtn').className = 'btn-save';
       document.getElementById('saveBtn').textContent = 'Save (Ctrl+S)';
 
-      // Update local state
       img.caption = result.caption;
       img.category = result.category;
       img.has_caption = true;
@@ -1239,7 +1371,6 @@ async function setCategory(cat) {
 function updateModalTagButtons() {
   const caption = document.getElementById('captionText').value.toLowerCase();
   const container = document.getElementById('quickTags');
-  // Keep the label, rebuild buttons
   container.innerHTML = '<label>Tags</label>';
 
   for (const tag of QUICK_TAGS) {
@@ -1285,7 +1416,6 @@ async function saveCaption() {
     document.getElementById('saveBtn').className = 'btn-save';
     document.getElementById('saveBtn').textContent = 'Save (Ctrl+S)';
 
-    // Update local state with new category
     const newCat = result.category || categorizeCaption(caption);
     img.caption = caption;
     img.category = newCat;
@@ -1313,7 +1443,6 @@ async function deleteCurrentInModal() {
     isDirty = false;
     showToast('Deleted');
 
-    // Remove from arrays
     allImages = allImages.filter(i => i.filename !== img.filename);
     filteredImages.splice(modalIdx, 1);
     selected.delete(img.filename);
@@ -1362,7 +1491,6 @@ function pollTask(taskId) {
       document.getElementById('taskLabel').textContent = task.name || 'Task';
       document.getElementById('taskStatus').textContent = task.message || '';
 
-      // Parse progress for bar width
       const match = (task.progress || '').match(new RegExp('^([0-9]+)/([0-9]+)$'));
       if (match) {
         const pct = Math.round((parseInt(match[1]) / parseInt(match[2])) * 100);
@@ -1372,7 +1500,6 @@ function pollTask(taskId) {
       if (task.status === 'running') {
         setTimeout(poll, 2000);
       } else {
-        // Done
         bar.className = 'task-bar active ' + (task.status === 'complete' ? 'complete' : 'failed');
         document.getElementById('taskFill').style.width = '100%';
 
@@ -1386,11 +1513,7 @@ function pollTask(taskId) {
         activeTaskId = null;
         document.getElementById('tagBtn').disabled = false;
         document.getElementById('tagBtn').textContent = 'Auto Caption';
-
-        // Refresh images
         loadImages();
-
-        // Auto-hide bar after 4 seconds
         setTimeout(() => { bar.className = 'task-bar'; }, 4000);
       }
     } catch (e) {
@@ -1507,7 +1630,6 @@ async function saveConfig() {
       updateConfigUI();
       document.getElementById('configStatus').textContent = 'Saved and reloaded';
       showToast('Config saved');
-      // Refresh images since config may affect categories/prefix
       loadImages();
     } else {
       showToast('Save failed: ' + (result.error || 'unknown'), true);
@@ -1536,19 +1658,14 @@ document.getElementById('configText').addEventListener('input', onConfigInput);
 
 // --- Keyboard shortcuts ---
 document.addEventListener('keydown', (e) => {
-  // Ctrl+S: save in whatever context is active
   if (e.ctrlKey && e.key === 's') {
     e.preventDefault();
     const modal = document.getElementById('modal');
-    if (modal.classList.contains('active')) {
-      saveCaption();
-    } else if (activeTab === 'config') {
-      saveConfig();
-    }
+    if (modal.classList.contains('active')) saveCaption();
+    else if (activeTab === 'config') saveConfig();
     return;
   }
 
-  // Modal-specific shortcuts
   const modal = document.getElementById('modal');
   if (!modal.classList.contains('active')) return;
 
@@ -1572,6 +1689,7 @@ function showToast(msg, isError) {
 }
 
 // --- Init ---
+initProjectSwitcher();
 loadImages();
 </script>
 </body>
@@ -1584,29 +1702,28 @@ loadImages();
 
 def main():
     parser = argparse.ArgumentParser(description="Dataset preparation server for LoRA training")
-    parser.add_argument("--model", required=True, choices=["pony", "lustify"],
-                        help="Base model (determines caption prefix)")
-    parser.add_argument("--dir", default=None,
-                        help="Dataset directory (default: from project.conf)")
+    parser.add_argument("--loras-dir", default=None,
+                        help="Parent directory to scan for projects (default: parent of this script)")
     parser.add_argument("--port", type=int, default=8899, help="Port (default: 8899)")
     args = parser.parse_args()
 
-    dataset_dir = args.dir or conf.get("DATASET_PATH", "dataset/img")
-    if not os.path.isdir(dataset_dir):
-        os.makedirs(dataset_dir, exist_ok=True)
-        print(f"  Created: {dataset_dir}")
+    loras_dir = args.loras_dir or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # If script is at ~/projects/loras/lora-dataset-ui/server.py, loras_dir = ~/projects/loras/
 
-    handler = make_handler(dataset_dir, args.model)
+    projects = discover_projects(loras_dir)
+    if not projects:
+        print(f"No projects found in {loras_dir}")
+        print("  Looking for directories containing project.conf")
+        sys.exit(1)
+
+    state = ServerState(projects)
+    handler = make_handler(state)
     server = HTTPServer(('0.0.0.0', args.port), handler)
 
-    img_count = sum(1 for f in os.listdir(dataset_dir)
-                    if os.path.splitext(f)[1].lower() in IMAGE_EXTENSIONS)
-    txt_count = sum(1 for f in os.listdir(dataset_dir) if f.endswith('.txt'))
-
     print(f"Dataset Prep Server")
-    print(f"  Model:     {args.model}")
-    print(f"  Directory: {os.path.abspath(dataset_dir)}")
-    print(f"  Images:    {img_count} ({txt_count} captioned)")
+    print(f"  Projects:  {', '.join(p['name'] for p in projects)}")
+    print(f"  Active:    {state.current} ({state.model})")
+    print(f"  Directory: {os.path.abspath(state.base_dir)}")
     print(f"  URL:       http://0.0.0.0:{args.port}")
     print()
 
