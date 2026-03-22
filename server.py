@@ -919,6 +919,8 @@ def make_handler(state):
                 self._delete_samples(self._read_body())
             elif path == '/api/training/loras/metadata':
                 self._save_lora_metadata(self._read_body())
+            elif path == '/api/config/update':
+                self._update_config_field(self._read_body())
             elif path == '/api/training/loras/preview':
                 self._set_lora_preview(self._read_body())
             else:
@@ -1115,6 +1117,33 @@ def make_handler(state):
                 self._json_response({'saved': True})
             except SystemExit:
                 self._json_response({'error': 'Config parse error'}, 400)
+            except Exception as e:
+                self._json_response({'error': str(e)}, 500)
+
+        def _update_config_field(self, data):
+            """Update a single field in project.conf."""
+            key = data.get('key', '')
+            value = data.get('value', '')
+            if not key:
+                self._json_response({'error': 'Missing key'}, 400)
+                return
+            try:
+                with open(state.conf_path, 'r') as f:
+                    lines = f.readlines()
+                found = False
+                for i, line in enumerate(lines):
+                    stripped = line.strip()
+                    if stripped.startswith(key + '=') or stripped.startswith(key + ' ='):
+                        lines[i] = f'{key}={value}\n'
+                        found = True
+                        break
+                if not found:
+                    lines.append(f'{key}={value}\n')
+                with open(state.conf_path, 'w') as f:
+                    f.writelines(lines)
+                state.conf = load_conf(state.conf_path)
+                print(f"  Updated {key}={value} in project.conf")
+                self._json_response({'saved': True})
             except Exception as e:
                 self._json_response({'error': str(e)}, 500)
 
@@ -2314,6 +2343,7 @@ function renderStats() {
   html += `<strong>NUM_REPEATS in project.conf:</strong> ${curReps} (~${curSteps} steps/epoch)`;
   if (s.current_repeats && s.current_repeats !== s.suggested_repeats) {
     html += ` \u2014 <span style="color:#f39c12">suggested: ${s.suggested_repeats} (~${sugSteps} steps/epoch, aim for 200\u2013400)</span>`;
+    html += ` <button class="btn-select" style="padding:3px 10px;font-size:0.8em;" onclick="applyRepeats(${s.suggested_repeats})">Apply</button>`;
   }
   html += '<br>';
   if (s.full_body_total > 0) {
@@ -2328,6 +2358,20 @@ function renderStats() {
   html += '</div>';
 
   view.innerHTML = html;
+}
+
+async function applyRepeats(value) {
+  try {
+    const resp = await fetch('/api/config/update', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: 'NUM_REPEATS', value: String(value)})
+    });
+    const data = await resp.json();
+    if (data.saved) {
+      showToast('NUM_REPEATS updated to ' + value);
+      loadImages();
+    } else showToast(data.error || 'Failed', true);
+  } catch (e) { showToast('Failed: ' + e.message, true); }
 }
 
 // --- Config tab ---
