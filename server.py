@@ -810,26 +810,41 @@ IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 
 
 def get_images_with_categories(base_dir):
-    """Return flat list of images with category metadata."""
+    """Return flat list of images with category metadata. Scans subdirectories too."""
     images = []
     if not os.path.isdir(base_dir):
         return images
-    for filename in sorted(os.listdir(base_dir)):
-        ext = os.path.splitext(filename)[1].lower()
-        if ext not in IMAGE_EXTENSIONS:
-            continue
-        txt_path = os.path.join(base_dir, os.path.splitext(filename)[0] + '.txt')
-        has_caption = os.path.isfile(txt_path)
-        caption = ""
-        category = "uncategorized"
-        if has_caption:
-            with open(txt_path, 'r') as f:
-                caption = f.read().strip()
-            category = categorize_caption(caption)
-        images.append({
-            "filename": filename, "has_caption": has_caption,
-            "caption": caption, "category": category,
-        })
+
+    def scan_dir(dirpath, prefix=""):
+        """Scan a directory for images. prefix is the relative subdirectory path."""
+        if not os.path.isdir(dirpath):
+            return
+        for filename in sorted(os.listdir(dirpath)):
+            filepath = os.path.join(dirpath, filename)
+            # Recurse into subdirectories (one level)
+            if os.path.isdir(filepath) and not prefix:
+                scan_dir(filepath, prefix=filename + "/")
+                continue
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in IMAGE_EXTENSIONS:
+                continue
+            rel_name = prefix + filename
+            txt_path = os.path.join(dirpath, os.path.splitext(filename)[0] + '.txt')
+            has_caption = os.path.isfile(txt_path)
+            caption = ""
+            category = "uncategorized"
+            if has_caption:
+                with open(txt_path, 'r') as f:
+                    caption = f.read().strip()
+                category = categorize_caption(caption)
+            subset = prefix.rstrip("/") if prefix else "main"
+            images.append({
+                "filename": rel_name, "has_caption": has_caption,
+                "caption": caption, "category": category,
+                "subset": subset,
+            })
+
+    scan_dir(base_dir)
     return images
 
 

@@ -7,6 +7,10 @@ set -euo pipefail
 # Usage:
 #   bash train_character.sh pony
 #   bash train_character.sh lustify
+#
+# Reads all hyperparameters from project.conf.
+# Supports weighted face subset (dataset/faces/) for better
+# facial detail learning.
 # ============================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,12 +31,29 @@ PROJECT_DIR="${PROJECT_DIR:-$SCRIPT_DIR}"
 
 # Computed paths
 DATASET_PATH_ABS="${PROJECT_DIR}/dataset"
+FACE_PATH_ABS="${PROJECT_DIR}/dataset/faces"
 OUTPUT_DIR="${PROJECT_DIR}/outputs"
 LOG_DIR="${PROJECT_DIR}/logs"
 CONFIG_FILE="${PROJECT_DIR}/.config_${MODEL}.toml"
 
 # Timestamp for unique output names
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+# Hyperparameters from project.conf (with defaults)
+LEARNING_RATE="${LEARNING_RATE:-8e-5}"
+UNET_LR="${LEARNING_RATE}"
+TEXT_ENCODER_LR="${TEXT_ENCODER_LR:-2e-5}"
+LR_SCHEDULER="${LR_SCHEDULER:-cosine_with_restarts}"
+LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-100}"
+LR_RESTART_CYCLES="${LR_RESTART_CYCLES:-1}"
+MAX_TRAIN_EPOCHS="${MAX_TRAIN_EPOCHS:-8}"
+SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-2}"
+NETWORK_DIM="${NETWORK_DIM:-64}"
+NETWORK_ALPHA="${NETWORK_ALPHA:-32}"
+NOISE_OFFSET="${NOISE_OFFSET:-0.0357}"
+MIN_SNR_GAMMA="${MIN_SNR_GAMMA:-5.0}"
+NUM_REPEATS="${NUM_REPEATS:-6}"
+FACE_REPEATS="${FACE_REPEATS:-20}"
 
 # Model-specific settings
 case "$MODEL" in
@@ -64,17 +85,34 @@ fi
 # Verify dataset exists
 if [[ ! -d "$DATASET_PATH_ABS" ]]; then
   echo "Error: Dataset not found at $DATASET_PATH_ABS"
-  echo "Run: bash setup.sh"
   exit 1
 fi
 
 # Count images
-IMG_COUNT=$(find "$DATASET_PATH_ABS" -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" | wc -l)
+IMG_COUNT=$(find "$DATASET_PATH_ABS" -maxdepth 1 -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" | wc -l)
 if [[ "$IMG_COUNT" -eq 0 ]]; then
   echo "Error: No images in $DATASET_PATH_ABS"
   exit 1
 fi
-echo "Dataset:  ${IMG_COUNT} images × ${NUM_REPEATS} repeats = $((IMG_COUNT * NUM_REPEATS)) steps/epoch"
+
+# Count face images
+FACE_COUNT=0
+HAS_FACES=false
+if [[ -d "$FACE_PATH_ABS" ]]; then
+  FACE_COUNT=$(find "$FACE_PATH_ABS" -maxdepth 1 -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" | wc -l)
+  if [[ "$FACE_COUNT" -gt 0 ]]; then
+    HAS_FACES=true
+  fi
+fi
+
+MAIN_STEPS=$((IMG_COUNT * NUM_REPEATS))
+FACE_STEPS=$((FACE_COUNT * FACE_REPEATS))
+TOTAL_STEPS=$((MAIN_STEPS + FACE_STEPS))
+echo "Dataset:  ${IMG_COUNT} main images × ${NUM_REPEATS} repeats = ${MAIN_STEPS} steps"
+if [[ "$HAS_FACES" == "true" ]]; then
+  echo "Faces:    ${FACE_COUNT} face images × ${FACE_REPEATS} repeats = ${FACE_STEPS} steps"
+fi
+echo "Total:    ${TOTAL_STEPS} steps/epoch"
 
 # Generate TOML config dynamically
 cat > "$CONFIG_FILE" << EOF
@@ -95,9 +133,28 @@ caption_dropout_rate = 0.0
     num_repeats = ${NUM_REPEATS}
 EOF
 
+# Add face subset if it exists and has images
+if [[ "$HAS_FACES" == "true" ]]; then
+  cat >> "$CONFIG_FILE" << EOF
+
+  [[datasets.subsets]]
+    image_dir = "${FACE_PATH_ABS}"
+    num_repeats = ${FACE_REPEATS}
+EOF
+fi
+
 echo "Config:   $CONFIG_FILE (generated)"
 echo "Model:    $MODEL_PATH"
 echo "Output:   $OUTPUT_DIR/$OUTPUT_NAME"
+echo ""
+echo "Hyperparameters:"
+echo "  learning_rate:    $LEARNING_RATE"
+echo "  text_encoder_lr:  $TEXT_ENCODER_LR"
+echo "  network_dim:      $NETWORK_DIM"
+echo "  network_alpha:    $NETWORK_ALPHA"
+echo "  epochs:           $MAX_TRAIN_EPOCHS"
+echo "  noise_offset:     $NOISE_OFFSET"
+echo "  min_snr_gamma:    $MIN_SNR_GAMMA"
 
 # Generate sample prompts dynamically
 SAMPLE_PROMPTS="${PROJECT_DIR}/.sample_prompts_${MODEL}.txt"
@@ -126,18 +183,6 @@ SAMPLE_ARGS="--sample_prompts=$SAMPLE_PROMPTS --sample_sampler=euler_a --sample_
 
 # Activate sd-scripts venv
 source "$SD_SCRIPTS/venv/bin/activate"
-
-# Hyperparameters
-LEARNING_RATE="1e-4"
-UNET_LR="1e-4"
-TEXT_ENCODER_LR="5e-5"
-LR_SCHEDULER="cosine_with_restarts"
-LR_WARMUP_STEPS=100
-LR_RESTART_CYCLES=1
-MAX_TRAIN_EPOCHS=10
-SAVE_EVERY_N_EPOCHS=2
-NETWORK_DIM=32
-NETWORK_ALPHA=16
 
 echo ""
 echo "Launching training..."
@@ -171,8 +216,8 @@ accelerate launch --num_cpu_threads_per_process 4 sdxl_train_network.py \
   --max_token_length=225 \
   --xformers \
   --bucket_no_upscale \
-  --min_snr_gamma=5.0 \
-  --noise_offset=0.0357 \
+  --min_snr_gamma=$MIN_SNR_GAMMA \
+  --noise_offset=$NOISE_OFFSET \
   $SAMPLE_ARGS \
   --logging_dir="$LOG_DIR"
 
