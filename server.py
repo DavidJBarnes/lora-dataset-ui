@@ -372,9 +372,20 @@ def merge_captions(existing_caption, wd14_raw, model, conf):
     return f"{prefix}, {cleaned}" if cleaned else prefix
 
 
+def _collect_image_dirs(dataset_dir):
+    """Return list of directories containing images (base + subdirs)."""
+    dirs = [dataset_dir]
+    if os.path.isdir(dataset_dir):
+        for entry in os.listdir(dataset_dir):
+            subdir = os.path.join(dataset_dir, entry)
+            if os.path.isdir(subdir):
+                dirs.append(subdir)
+    return dirs
+
+
 def run_tagger_task(task_id, dataset_dir, model, conf):
-    """Background task: run WD14 tagger on all images, merge with existing captions."""
-    existing_captions = {}
+    """Background task: run WD14 tagger on all images including subdirectories."""
+    all_existing_captions = {}  # {abs_txt_path: caption}
     try:
         sd_scripts = conf.get("SD_SCRIPTS", "")
         if not sd_scripts or not os.path.isdir(sd_scripts):
@@ -392,62 +403,82 @@ def run_tagger_task(task_id, dataset_dir, model, conf):
             return
 
         image_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
-        image_files = [f for f in os.listdir(dataset_dir)
-                       if os.path.splitext(f)[1].lower() in image_exts]
+        image_dirs = _collect_image_dirs(dataset_dir)
 
-        for img_file in image_files:
+        # Collect all images across all directories
+        all_images = []  # [(dir_path, filename)]
+        for d in image_dirs:
+            for f in os.listdir(d):
+                if os.path.splitext(f)[1].lower() in image_exts:
+                    all_images.append((d, f))
+
+        if not all_images:
+            update_task(task_id, status="failed", error="No images found")
+            return
+
+        # Back up and remove existing captions
+        for d, img_file in all_images:
             txt_file = os.path.splitext(img_file)[0] + '.txt'
-            txt_path = os.path.join(dataset_dir, txt_file)
+            txt_path = os.path.join(d, txt_file)
             if os.path.isfile(txt_path):
                 with open(txt_path, 'r') as f:
-                    existing_captions[txt_file] = f.read().strip()
+                    all_existing_captions[txt_path] = f.read().strip()
                 os.remove(txt_path)
 
         gpu = conf.get("TAGGER_GPU", "false").lower() == "true"
         batch_size = "8" if gpu else "1"
-        update_task(task_id, progress=f"0/{len(image_files)}",
-                    message=f"Running WD14 tagger ({'GPU' if gpu else 'CPU'}, batch={batch_size}) on {len(image_files)} images...")
+        total = len(all_images)
+        update_task(task_id, progress=f"0/{total}",
+                    message=f"Running WD14 tagger ({'GPU' if gpu else 'CPU'}, batch={batch_size}) on {total} images...")
 
         model_dir = os.path.join(sd_scripts, "wd14_models")
-        cmd = [
-            venv_python, tagger_script,
-            "--onnx", "--batch_size", batch_size,
-            "--thresh", "0.35", "--caption_extension", ".txt",
-            "--model_dir", model_dir, dataset_dir,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
-        if result.returncode != 0:
-            for txt_file, content in existing_captions.items():
-                with open(os.path.join(dataset_dir, txt_file), 'w') as f:
-                    f.write(content)
-            update_task(task_id, status="failed",
-                        error=f"Auto-caption failed: {result.stderr[:500]}")
-            return
+        # Run tagger on each directory separately (WD14 tagger doesn't recurse)
+        for d in image_dirs:
+            has_images = any(os.path.splitext(f)[1].lower() in image_exts
+                            for f in os.listdir(d))
+            if not has_images:
+                continue
+            cmd = [
+                venv_python, tagger_script,
+                "--onnx", "--batch_size", batch_size,
+                "--thresh", "0.35", "--caption_extension", ".txt",
+                "--model_dir", model_dir, d,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if result.returncode != 0:
+                # Restore all backups on failure
+                for txt_path, content in all_existing_captions.items():
+                    with open(txt_path, 'w') as f:
+                        f.write(content)
+                update_task(task_id, status="failed",
+                            error=f"Auto-caption failed: {result.stderr[:500]}")
+                return
 
+        # Merge WD14 output with existing captions
         processed = 0
-        for img_file in image_files:
+        for d, img_file in all_images:
             txt_file = os.path.splitext(img_file)[0] + '.txt'
-            txt_path = os.path.join(dataset_dir, txt_file)
+            txt_path = os.path.join(d, txt_file)
             if not os.path.isfile(txt_path):
                 continue
             with open(txt_path, 'r') as f:
                 wd14_raw = f.read().strip()
-            if txt_file in existing_captions:
-                merged = merge_captions(existing_captions[txt_file], wd14_raw, model, conf)
+            if txt_path in all_existing_captions:
+                merged = merge_captions(all_existing_captions[txt_path], wd14_raw, model, conf)
             else:
                 merged = cleanup_caption(wd14_raw, model, conf)
             with open(txt_path, 'w') as f:
                 f.write(merged)
             processed += 1
-            update_task(task_id, progress=f"{processed}/{len(image_files)}")
+            update_task(task_id, progress=f"{processed}/{total}")
 
         update_task(task_id, status="complete",
                     message=f"Auto-captioned {processed} images")
 
     except (subprocess.TimeoutExpired, Exception) as e:
-        for txt_file, content in existing_captions.items():
-            with open(os.path.join(dataset_dir, txt_file), 'w') as f:
+        for txt_path, content in all_existing_captions.items():
+            with open(txt_path, 'w') as f:
                 f.write(content)
         update_task(task_id, status="failed", error=str(e))
 
