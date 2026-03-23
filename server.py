@@ -201,10 +201,10 @@ CATEGORY_PRIMARY_TAG = {
 }
 
 IDEAL_RATIO = {
-    "face_closeup": 0.10,
+    "face_closeup": 0.20,
     "head_shoulders": 0.10,
     "upper_body": 0.15,
-    "full_body": 0.65,
+    "full_body": 0.55,
     "uncategorized": 0.00,
 }
 
@@ -879,7 +879,7 @@ def get_images_with_categories(base_dir):
     return images
 
 
-MAX_RECOMMENDED = 50  # Character LoRAs: 30-50 images is the sweet spot
+MAX_RECOMMENDED = 60  # Character LoRAs: 40-60 images with 30% face/portrait
 
 
 def compute_stats(images):
@@ -2620,7 +2620,7 @@ function renderStats() {
     html += ` <span style="color:#e74c3c">(over ${s.max_recommended} recommended max — risk of overfitting)</span>`;
   }
   html += '<br>';
-  html += `<strong>Recommended:</strong> 30\u201350 images for character LoRAs<br>`;
+  html += `<strong>Recommended:</strong> 40\u201360 images (30% face/portrait, 70% body)<br>`;
   const curReps = s.current_repeats || '?';
   const curSteps = s.current_repeats ? s.total * s.current_repeats : '?';
   const sugSteps = s.total * s.suggested_repeats;
