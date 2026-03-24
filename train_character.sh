@@ -69,8 +69,14 @@ case "$MODEL" in
     KEEP_TOKENS=1
     echo "Training: Lustify-SDXL"
     ;;
+  realvis)
+    MODEL_PATH="$REALVIS_MODEL_PATH"
+    OUTPUT_NAME="${TRIGGER}_realvis_${VERSION}_${TIMESTAMP}"
+    KEEP_TOKENS=1
+    echo "Training: RealVisXL V5.0"
+    ;;
   *)
-    echo "Error: Unknown model '$MODEL'. Use 'pony' or 'lustify'."
+    echo "Error: Unknown model '$MODEL'. Use 'pony', 'lustify', or 'realvis'."
     exit 1
     ;;
 esac
@@ -168,7 +174,7 @@ score_9, score_8_up, score_7_up, source_realistic, ${TRIGGER} ${CLASS}, close-up
 score_9, score_8_up, score_7_up, source_realistic, ${TRIGGER} ${CLASS}, upper body, office, professional clothing, serious expression --n score_6, score_5, score_4, worst quality, low quality, bad anatomy, bad hands, imperfect eyes, skewed eyes, unnatural face --w 896 --h 1152 --l 5 --s 30
 EOF
     ;;
-  lustify)
+  lustify|realvis)
     cat > "$SAMPLE_PROMPTS" << EOF
 ${TRIGGER} ${CLASS}, portrait, studio lighting, looking at viewer, neutral expression, detailed skin --n worst quality, low quality, blurry, bad anatomy, bad hands, deformed face --w 1024 --h 1024 --l 5 --s 30
 ${TRIGGER} ${CLASS}, full body, standing in a park, natural lighting, casual clothing, smile --n worst quality, low quality, blurry, bad anatomy, bad hands, deformed face --w 832 --h 1216 --l 5 --s 30

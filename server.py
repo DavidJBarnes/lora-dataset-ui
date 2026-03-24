@@ -51,11 +51,13 @@ from project_config import load_conf
 def detect_model(project_dir, conf):
     """Determine model type from conf or directory name."""
     model = conf.get("MODEL", "").lower()
-    if model in ("pony", "lustify"):
+    if model in ("pony", "lustify", "realvis"):
         return model
     dirname = os.path.basename(project_dir).lower()
     if "pony" in dirname:
         return "pony"
+    if "realvis" in dirname:
+        return "realvis"
     if "lustify" in dirname:
         return "lustify"
     return "lustify"
