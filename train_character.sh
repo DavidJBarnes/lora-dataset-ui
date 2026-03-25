@@ -61,19 +61,22 @@ case "$MODEL" in
     MODEL_PATH="$PONY_MODEL_PATH"
     OUTPUT_NAME="${TRIGGER}_pony_${VERSION}_${TIMESTAMP}"
     KEEP_TOKENS=6
-    echo "Training: CyberRealistic Pony"
+    CLIP_SKIP=2
+    echo "Training: CyberRealistic Pony (clip_skip=2)"
     ;;
   lustify)
     MODEL_PATH="$LUSTIFY_MODEL_PATH"
     OUTPUT_NAME="${TRIGGER}_lustify_${VERSION}_${TIMESTAMP}"
     KEEP_TOKENS=1
-    echo "Training: Lustify-SDXL"
+    CLIP_SKIP=1
+    echo "Training: Lustify-SDXL (clip_skip=1)"
     ;;
   realvis)
     MODEL_PATH="$REALVIS_MODEL_PATH"
     OUTPUT_NAME="${TRIGGER}_realvis_${VERSION}_${TIMESTAMP}"
     KEEP_TOKENS=1
-    echo "Training: RealVisXL V5.0"
+    CLIP_SKIP=1
+    echo "Training: RealVisXL V5.0 (clip_skip=1)"
     ;;
   *)
     echo "Error: Unknown model '$MODEL'. Use 'pony', 'lustify', or 'realvis'."
@@ -222,6 +225,7 @@ accelerate launch --num_cpu_threads_per_process 4 sdxl_train_network.py \
   --max_token_length=225 \
   --xformers \
   --bucket_no_upscale \
+  --clip_skip=$CLIP_SKIP \
   --min_snr_gamma=$MIN_SNR_GAMMA \
   --noise_offset=$NOISE_OFFSET \
   $SAMPLE_ARGS \
