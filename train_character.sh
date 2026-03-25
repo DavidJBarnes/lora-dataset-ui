@@ -40,6 +40,7 @@ CONFIG_FILE="${PROJECT_DIR}/.config_${MODEL}.toml"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Hyperparameters from project.conf (with defaults)
+OPTIMIZER_TYPE="${OPTIMIZER_TYPE:-AdamW8bit}"
 LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 UNET_LR="${LEARNING_RATE}"
 TEXT_ENCODER_LR="${TEXT_ENCODER_LR:-2e-5}"
@@ -48,12 +49,23 @@ LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-100}"
 LR_RESTART_CYCLES="${LR_RESTART_CYCLES:-1}"
 MAX_TRAIN_EPOCHS="${MAX_TRAIN_EPOCHS:-8}"
 SAVE_EVERY_N_EPOCHS="${SAVE_EVERY_N_EPOCHS:-2}"
-NETWORK_DIM="${NETWORK_DIM:-64}"
-NETWORK_ALPHA="${NETWORK_ALPHA:-32}"
+NETWORK_DIM="${NETWORK_DIM:-32}"
+NETWORK_ALPHA="${NETWORK_ALPHA:-16}"
 NOISE_OFFSET="${NOISE_OFFSET:-0.0357}"
 MIN_SNR_GAMMA="${MIN_SNR_GAMMA:-5.0}"
-NUM_REPEATS="${NUM_REPEATS:-6}"
+NUM_REPEATS="${NUM_REPEATS:-8}"
 FACE_REPEATS="${FACE_REPEATS:-20}"
+
+# Prodigy optimizer settings
+if [[ "$OPTIMIZER_TYPE" == "Prodigy" ]]; then
+  LEARNING_RATE="1.0"
+  UNET_LR="1.0"
+  TEXT_ENCODER_LR="1.0"
+  LR_SCHEDULER="constant_with_warmup"
+  OPTIMIZER_ARGS='--optimizer_args "decouple=True" "weight_decay=0.01" "d_coef=2" "use_bias_correction=True" "safeguard_warmup=True"'
+else
+  OPTIMIZER_ARGS=""
+fi
 
 # Model-specific settings
 case "$MODEL" in
@@ -215,7 +227,8 @@ accelerate launch --num_cpu_threads_per_process 4 sdxl_train_network.py \
   --network_module=networks.lora \
   --network_dim=$NETWORK_DIM \
   --network_alpha=$NETWORK_ALPHA \
-  --optimizer_type="AdamW8bit" \
+  --optimizer_type="$OPTIMIZER_TYPE" \
+  $OPTIMIZER_ARGS \
   --mixed_precision="bf16" \
   --cache_latents \
   --cache_latents_to_disk \
