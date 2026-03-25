@@ -164,6 +164,26 @@ if [[ "$HAS_FACES" == "true" ]]; then
 EOF
 fi
 
+# Add regularization images if reg/ directory exists and has images
+REG_PATH_ABS="${PROJECT_DIR}/reg"
+HAS_REG=false
+REG_COUNT=0
+if [[ -d "$REG_PATH_ABS" ]]; then
+  REG_COUNT=$(find "$REG_PATH_ABS" -maxdepth 1 -name "*.png" -o -name "*.jpg" -o -name "*.jpeg" -o -name "*.webp" | wc -l)
+  if [[ "$REG_COUNT" -gt 0 ]]; then
+    HAS_REG=true
+    cat >> "$CONFIG_FILE" << EOF
+
+  [[datasets.subsets]]
+    image_dir = "${REG_PATH_ABS}"
+    class_tokens = "${CLASS}"
+    is_reg = true
+    num_repeats = 1
+EOF
+    echo "Reg:      ${REG_COUNT} regularization images"
+  fi
+fi
+
 echo "Config:   $CONFIG_FILE (generated)"
 echo "Model:    $MODEL_PATH"
 echo "Output:   $OUTPUT_DIR/$OUTPUT_NAME"
