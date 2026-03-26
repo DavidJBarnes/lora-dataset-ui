@@ -786,44 +786,93 @@ def finalize_training(project_dir):
 def monitor_training(task_id, run_id, project_dir, model_type):
     """Background thread that polls the log file and updates task state."""
     global _active_training
+    # Persistent state across polls — avoids re-parsing entire log
+    loss_history = []
+    current_epoch = 0
+    total_epochs = 0
+    step = 0
+    total_steps = 0
+    avg_loss = None
+    elapsed = ""
+    eta = ""
+    last_loss_step = -1
+    log_tail = []
+    file_pos = 0  # Track read position in log file
+
     try:
         while True:
-            time.sleep(2)
+            time.sleep(5)
             pid = check_training_alive(project_dir)
-            parsed = parse_training_log(project_dir)
+
+            # Incremental log parsing — only read new bytes
+            log_path = _training_log_path(project_dir)
+            if os.path.isfile(log_path):
+                with open(log_path, 'r', errors='replace') as f:
+                    f.seek(file_pos)
+                    new_data = f.read()
+                    file_pos = f.tell()
+
+                for raw_line in new_data.split('\n'):
+                    for part in raw_line.split('\r'):
+                        line = part.strip()
+                        if not line:
+                            continue
+                        log_tail.append(line)
+                        if len(log_tail) > 20:
+                            log_tail.pop(0)
+
+                        m = _RE_EPOCH.search(line)
+                        if m:
+                            current_epoch = int(m.group(1))
+                            total_epochs = int(m.group(2))
+
+                        m = _RE_STEP.search(line)
+                        if m:
+                            step = int(m.group(1))
+                            total_steps = int(m.group(2))
+                            avg_loss = float(m.group(3))
+                            if step - last_loss_step >= 10:
+                                loss_history.append({"step": step, "loss": avg_loss})
+                                last_loss_step = step
+                            bracket = re.search(r'\[(\d+:\d+)<(\d+:\d+)', line)
+                            if bracket:
+                                elapsed = bracket.group(1)
+                                eta = bracket.group(2)
 
             checkpoints = list_lora_files(project_dir)
             samples = list_sample_images(project_dir)
 
-            msg = f"Epoch {parsed.get('epoch',0)}/{parsed.get('total_epochs','?')} — Step {parsed.get('step',0)}/{parsed.get('total_steps','?')}"
-            if parsed.get("avg_loss") is not None:
-                msg += f" — Loss: {parsed['avg_loss']:.4f}"
+            msg = f"Epoch {current_epoch}/{total_epochs or '?'} — Step {step}/{total_steps or '?'}"
+            if avg_loss is not None:
+                msg += f" — Loss: {avg_loss:.4f}"
+            if eta:
+                msg += f" — ETA: {eta}"
+            if elapsed:
+                msg += f" (elapsed: {elapsed})"
 
             update_task(task_id,
-                        progress=f"{parsed.get('step',0)}/{parsed.get('total_steps',0)}",
+                        progress=f"{step}/{total_steps}",
                         message=msg,
                         training={"run_id": run_id, "model": model_type,
-                                  "epoch": parsed.get("epoch", 0),
-                                  "total_epochs": parsed.get("total_epochs", 0),
-                                  "step": parsed.get("step", 0),
-                                  "total_steps": parsed.get("total_steps", 0),
-                                  "avg_loss": parsed.get("avg_loss"),
-                                  "loss_history": parsed.get("loss_history", []),
+                                  "epoch": current_epoch,
+                                  "total_epochs": total_epochs,
+                                  "step": step,
+                                  "total_steps": total_steps,
+                                  "avg_loss": avg_loss,
+                                  "loss_history": loss_history[-200:],
                                   "checkpoints": checkpoints,
                                   "samples": samples,
-                                  "elapsed": parsed.get("elapsed", ""),
-                                  "eta": parsed.get("eta", "")})
+                                  "elapsed": elapsed,
+                                  "eta": eta})
 
             if pid is None:
                 # Process finished
                 finalize_training(project_dir)
-                final_loss = parsed.get("avg_loss")
-                total_epochs = parsed.get("total_epochs", 0)
                 if total_epochs > 0:
                     update_task(task_id, status="complete",
-                                message=f"Training complete — {total_epochs} epochs, final loss: {final_loss:.4f}" if final_loss else "Training complete")
+                                message=f"Training complete — {total_epochs} epochs, final loss: {avg_loss:.4f}" if avg_loss else "Training complete")
                 else:
-                    tail = '\n'.join(parsed.get("log_tail", [])[-10:])
+                    tail = '\n'.join(log_tail[-10:])
                     update_task(task_id, status="failed",
                                 error=f"Training failed\n{tail}")
                 break
