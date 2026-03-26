@@ -62,7 +62,7 @@ if [[ "$OPTIMIZER_TYPE" == "Prodigy" ]]; then
   UNET_LR="1.0"
   TEXT_ENCODER_LR="1.0"
   LR_SCHEDULER="constant_with_warmup"
-  OPTIMIZER_ARGS='--optimizer_args "decouple=True" "weight_decay=0.01" "d_coef=2" "use_bias_correction=True" "safeguard_warmup=True"'
+  OPTIMIZER_ARGS='--optimizer_args decouple=True weight_decay=0.01 d_coef=2 use_bias_correction=True safeguard_warmup=True'
 else
   OPTIMIZER_ARGS=""
 fi
